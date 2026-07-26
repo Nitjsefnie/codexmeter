@@ -158,6 +158,38 @@ def _proj_rollup(project: str | None, args: list) -> str:
     return "AND u.project_id = %s"
 
 
+def _tool_source(bucket_s: int) -> str:
+    """FROM-clause for the tool endpoints, aliased `t` either way.
+
+    `tool_rollup` is hourly, so it can only express display buckets at
+    least an hour wide; the 24h view buckets at 5 minutes and falls back
+    to a live per-call subquery shaped with the SAME column names, which
+    is what lets both endpoints be written once.
+    """
+    if bucket_s >= 3600:
+        return "tool_rollup t"
+    return """(
+      SELECT tu.ts AS hour, f.project_id, tu.tool_name,
+             1::bigint AS n_total,
+             (CASE WHEN tu.is_error IS NOT NULL THEN 1 ELSE 0 END)::bigint AS n_rated,
+             (CASE WHEN tu.is_error THEN 1 ELSE 0 END)::bigint            AS n_error
+        FROM tool_uses tu
+        JOIN files f ON f.file_key = tu.file_key
+       WHERE tu.ts IS NOT NULL
+    ) t"""
+
+
+def _proj_tool(project: str | None, args: list) -> str:
+    """Project filter against the tool source, which carries project_id."""
+    if not project:
+        return ""
+    if project == UNRESOLVED_PROJECT_ID:
+        return ("AND t.project_id IN (SELECT project_id FROM projects "
+                f"WHERE {_unresolved_cond()})")
+    args.append(project)
+    return "AND t.project_id = %s"
+
+
 @router.get("/me")
 def me(request: Request) -> dict:
     """Identity probe — frontend uses `is_guest` to decide which UI
@@ -196,19 +228,18 @@ def tool_usage(
     if model and not any(m in model for m in _ONLY_MODELS):
         return {"range": range, "project": project, "bucket_s": bucket_s, "buckets": []}
     args: list[Any] = [since]
-    proj_filter = _proj_filter(project, args)
+    proj_filter = _proj_tool(project, args)
 
     with db.viz_conn() as c:
         rows = c.execute(
             f"""
             SELECT to_timestamp(
-                     floor(EXTRACT(EPOCH FROM tu.ts) / {bucket_s}) * {bucket_s} + {bucket_s} / 2
+                     floor(EXTRACT(EPOCH FROM t.hour) / {bucket_s}) * {bucket_s} + {bucket_s} / 2
                    ) AS bucket,
-                   tu.tool_name AS tool,
-                   COUNT(*)     AS n
-            FROM tool_uses tu
-            JOIN files f ON f.file_key = tu.file_key
-            WHERE tu.ts >= %s {proj_filter}
+                   t.tool_name    AS tool,
+                   SUM(t.n_total) AS n
+            FROM {_tool_source(bucket_s)}
+            WHERE t.hour >= %s {proj_filter}
             GROUP BY 1, 2
             ORDER BY 1, 2
             """,
@@ -252,24 +283,22 @@ def tool_error_rate(
     if model and not any(m in model for m in _ONLY_MODELS):
         return {"range": range, "project": project, "bucket_s": bucket_s, "buckets": []}
     args: list[Any] = [since]
-    proj_filter = _proj_filter(project, args)
+    proj_filter = _proj_tool(project, args)
 
     with db.viz_conn() as c:
         rows = c.execute(
             f"""
             SELECT to_timestamp(
-                     floor(EXTRACT(EPOCH FROM tu.ts) / {bucket_s}) * {bucket_s} + {bucket_s} / 2
+                     floor(EXTRACT(EPOCH FROM t.hour) / {bucket_s}) * {bucket_s} + {bucket_s} / 2
                    ) AS bucket,
-                   %s           AS model,
-                   tu.tool_name AS tool,
-                   COUNT(*)                              AS n_total,
-                   COUNT(*) FILTER (WHERE tu.is_error)   AS n_error
-            FROM tool_uses tu
-            JOIN files   f ON f.file_key = tu.file_key
-            WHERE tu.is_error IS NOT NULL
-              AND tu.ts >= %s
-              {proj_filter}
+                   %s          AS model,
+                   t.tool_name AS tool,
+                   SUM(t.n_rated) AS n_total,
+                   SUM(t.n_error) AS n_error
+            FROM {_tool_source(bucket_s)}
+            WHERE t.hour >= %s {proj_filter}
             GROUP BY 1, 3
+            HAVING SUM(t.n_rated) > 0
             ORDER BY 1, 3
             """,
             [model if model else _ONLY_MODELS[0], *args],
@@ -348,6 +377,61 @@ def activity_heatmap(
     }
 
 
+# Bucket widths latency_rollup is built for (ingest.LATENCY_BUCKETS).
+_LATENCY_ROLLUP_BUCKETS = (3600, 21600, 43200, 86400)
+
+
+def _latency_rollup_rows(bucket_s: int, since, project, model):
+    """(bands, outliers) from `latency_rollup`, or None to use the live path.
+
+    The rollup cannot answer two cases:
+      * sub-hour display buckets (the 24h view) are not built — a row per
+        five minutes of all history to serve one day is not worth storing.
+      * the <unresolved> sentinel selects a GROUP of projects, and a
+        percentile over that group is not derivable from the per-project
+        rows the table holds. Only a single project (or no filter, which
+        is the stored project_id = '' row) can be served.
+    """
+    if bucket_s not in _LATENCY_ROLLUP_BUCKETS:
+        return None
+    if project == UNRESOLVED_PROJECT_ID:
+        return None
+
+    args: list[Any] = [bucket_s, project or "", since]
+    model_filter = ""
+    if model:
+        model_filter = "AND model LIKE %s"
+        args.append(f"%{model}%")
+
+    with db.viz_conn() as c:
+        rows = c.execute(
+            f"""
+            SELECT bucket, model, n, p10, p50, p90, outliers
+            FROM latency_rollup
+            WHERE bucket_s = %s AND project_id = %s AND bucket >= %s
+              {model_filter}
+            ORDER BY bucket, model
+            """,
+            args,
+        ).fetchall()
+
+    bands, outliers = [], []
+    for (b, m, n, p10, p50, p90, dots) in rows:
+        bands.append({
+            "ts": _iso(b), "model": m, "n": int(n or 0),
+            "p10": float(p10 or 0), "p50": float(p50 or 0), "p90": float(p90 or 0),
+        })
+        for d in (dots or []):
+            outliers.append({
+                "ts": d.get("ts"),
+                "model": m,
+                "latency_s": float(d.get("latency_s") or 0),
+                "file_key": d.get("file_key"),
+                "line": int(d.get("line_num") or 0),
+            })
+    return bands, outliers
+
+
 @router.get("/reply-latency")
 @cache_response
 def reply_latency(
@@ -359,15 +443,31 @@ def reply_latency(
     top/bottom 1% outliers. Latency is the gap from each anchored user
     message to its assistant reply, computed at parse time
     (records.reply_latency_s). Model & project filters apply to the
-    assistant record's model/project."""
+    assistant record's model/project.
+
+    Percentiles do not compose, so this cannot sum a fine-grained rollup
+    the way /api/dashboard does. It reads `latency_rollup` instead, which
+    stores the bands already computed per display bucket width — the
+    buckets are epoch-aligned, so a range filter just selects which rows
+    to return, exactly rather than approximately. See _latency_rollup_rows
+    for when that path does not apply."""
     delta = _parse_range(range)
     since = datetime.now(timezone.utc) - delta
     bucket_s = _bucket_seconds(delta)
+
+    rolled = _latency_rollup_rows(bucket_s, since, project, model)
+    if rolled is not None:
+        bands, outliers = rolled
+        return {
+            "range": range,
+            "project": project,
+            "model": model,
+            "bucket_s": bucket_s,
+            "bands": bands,
+            "outliers": outliers,
+        }
+
     args: list[Any] = []
-    if model:
-        # JOIN happens at the records level via the WHERE clause; no
-        # separate join arg needed since records IS the source.
-        pass
     args.append(since)
     proj_filter = _proj_filter(project, args)
     model_filter = ""

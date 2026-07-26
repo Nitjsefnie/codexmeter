@@ -96,6 +96,77 @@ CREATE TABLE IF NOT EXISTS usage_rollup (
 CREATE INDEX IF NOT EXISTS usage_rollup_hour_idx ON usage_rollup (hour);
 CREATE INDEX IF NOT EXISTS usage_rollup_project_idx ON usage_rollup (project_id, hour);
 
+-- Pre-aggregated tool calls, rebuilt at ingest alongside usage_rollup.
+-- Serves /api/tool-usage and /api/tool-error-rate, which were the last
+-- endpoints still scanning a raw table per request (tool_uses, joined to
+-- files for the project).
+--
+-- No `model` dimension, unlike usage_rollup: in Kimi wire.jsonl
+-- tool_uses.line_num and records.line_num are disjoint (ToolCall lines vs
+-- StatusUpdate lines), so there is no per-tool-call model to join to.
+-- Both endpoints already treat model as a whole-dataset constant.
+--
+-- The two endpoints count DIFFERENT populations, so both are stored:
+--   n_total  every tool_use in the group           -> /api/tool-usage
+--   n_rated  those with is_error NOT NULL (settled
+--            calls, which is all tool_error_rate
+--            counts)                               -> denominator
+--   n_error  of those, the ones that errored       -> numerator
+CREATE TABLE IF NOT EXISTS tool_rollup (
+  hour        TIMESTAMPTZ NOT NULL,
+  project_id  TEXT        NOT NULL,
+  tool_name   TEXT        NOT NULL,
+  n_total     BIGINT      NOT NULL DEFAULT 0,
+  n_rated     BIGINT      NOT NULL DEFAULT 0,
+  n_error     BIGINT      NOT NULL DEFAULT 0,
+  PRIMARY KEY (hour, project_id, tool_name)
+);
+CREATE INDEX IF NOT EXISTS tool_rollup_hour_idx ON tool_rollup (hour);
+CREATE INDEX IF NOT EXISTS tool_rollup_project_idx ON tool_rollup (project_id, hour);
+
+-- Pre-aggregated reply-latency bands + outlier dots for /api/reply-latency.
+--
+-- Percentiles do NOT compose across buckets, so unlike usage_rollup this
+-- cannot be stored at one fine grain and summed up. What makes it
+-- precomputable anyway is that the display buckets are epoch-aligned and
+-- deterministic -- floor(epoch / bucket_s) * bucket_s does not move with
+-- `now` -- and the UI only ever uses a fixed set of widths. So the
+-- percentiles are computed once PER bucket_s and a range filter merely
+-- selects which buckets to return. Exact, not approximate.
+-- The sub-hour widths (the 24h view) are excluded: they would need a row
+-- per 5 minutes of all history to serve one day, so those ranges keep the
+-- live path.
+--
+-- project_id = '' is the ALL-PROJECTS row. It has to be stored
+-- separately because a filter changes the population inside each
+-- (bucket, model) group, and p50 over all projects is not derivable from
+-- the per-project p50s. The model filter needs no such treatment -- the
+-- rows are already grouped by model, so filtering selects whole groups.
+--
+-- `outliers` holds the top/bottom 1% dots the panel draws, as
+-- [{ts, latency_s, file_key, line_num}], only for buckets with n >= 100
+-- (1% of fewer would just be the min/max).
+CREATE TABLE IF NOT EXISTS latency_rollup (
+  bucket_s    INTEGER     NOT NULL,
+  bucket      TIMESTAMPTZ NOT NULL,
+  project_id  TEXT        NOT NULL,
+  model       TEXT        NOT NULL,
+  n           BIGINT      NOT NULL,
+  p10         DOUBLE PRECISION,
+  p50         DOUBLE PRECISION,
+  p90         DOUBLE PRECISION,
+  outliers    JSONB       NOT NULL DEFAULT '[]'::jsonb,
+  PRIMARY KEY (bucket_s, bucket, project_id, model)
+);
+CREATE INDEX IF NOT EXISTS latency_rollup_lookup_idx
+  ON latency_rollup (bucket_s, project_id, bucket);
+
+-- Only a minority of records carry a reply_latency_s; a partial covering
+-- index keeps the live path (and the rollup build) off the rest.
+CREATE INDEX IF NOT EXISTS records_latency_idx ON records (ts)
+  INCLUDE (model, reply_latency_s, file_key, line_num)
+  WHERE reply_latency_s IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS records_uuid_idx ON records (uuid) WHERE uuid IS NOT NULL;
 CREATE INDEX IF NOT EXISTS records_ts_idx ON records (ts);
 -- Every read endpoint filters `is_canonical AND ts >= ...`.

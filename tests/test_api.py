@@ -431,3 +431,110 @@ def test_dashboard_response_is_cached_and_fresh_bypasses(app_with_fresh_data):
 
     fresh = app_with_fresh_data.get("/api/dashboard?range=all&fresh=1").json()
     assert fresh["cost_by_model"] == []          # fresh=1 sees the empty DB
+
+
+# --------------------------------------------------- rollup == live path
+
+def _insert_latency_probe_rows():
+    """Seed enough latencies in one bucket to cross the outlier threshold.
+
+    The mini mirror yields a single record with a reply_latency_s, so the
+    outlier branch (only buckets with n >= 100 get dots) would never run.
+    150 rows in one hour means 1% is 2 dots per end — enough to catch a
+    floor-vs-ceil cutoff, which is exactly the bug this rollup invites.
+    """
+    import psycopg
+    with psycopg.connect(os.environ["DATABASE_URL_VIZ"]) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO records (file_key, line_num, uuid, ts, model, "
+            "                     output_tokens, cost_usd, reply_latency_s) "
+            "SELECT f.file_key, 8000 + i, 'lat-probe-' || i, "
+            "       TIMESTAMPTZ '2026-02-03 04:00:00+00' + make_interval(secs => i), "
+            "       'lat-probe-model', 1, 0, i * 0.5 "
+            "FROM files f, generate_series(1, 150) AS i "
+            "WHERE f.file_key = (SELECT MIN(file_key) FROM files)"
+        )
+        conn.commit()
+
+    from backend import ingest
+    ingest.recompute_canonical()
+    ingest.rebuild_latency_rollup()
+
+
+def test_reply_latency_rollup_matches_live_path(app_with_fresh_data, monkeypatch):
+    """latency_rollup must return exactly what the live query returns.
+
+    The rollup exists because percentiles cannot be summed across buckets;
+    it is only correct because the display buckets are epoch-aligned. That
+    is an easy thing to get subtly wrong (an off-by-one in the outlier
+    cutoff, a bucket-centering mismatch), so compare the two paths rather
+    than trusting the port.
+    """
+    from backend import api as api_mod
+    from backend import cache
+
+    _insert_latency_probe_rows()
+
+    rolled = app_with_fresh_data.get("/api/reply-latency?range=3650d").json()
+    assert rolled["bands"], "probe rows must produce bands"
+    assert rolled["outliers"], "probe bucket must cross the n >= 100 dot threshold"
+
+    # Empty the eligible-width list so the same request takes the live path.
+    monkeypatch.setattr(api_mod, "_LATENCY_ROLLUP_BUCKETS", ())
+    cache.response_cache.clear()
+    live = app_with_fresh_data.get("/api/reply-latency?range=3650d").json()
+
+    assert rolled["bands"] == live["bands"]
+    assert rolled["outliers"] == live["outliers"]
+
+
+def _insert_tool_probe_rows():
+    """Seed tool calls with a known error mix.
+
+    The mini R2 mirror produces no tool_uses at all, so without this the
+    rollup-vs-live comparison below would compare two empty lists and
+    prove nothing. Settled (is_error NOT NULL) and unsettled calls are
+    both present because the two endpoints count different populations:
+    tool-usage counts all of them, tool-error-rate only the settled ones.
+    """
+    import psycopg
+    with psycopg.connect(os.environ["DATABASE_URL_VIZ"]) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO tool_uses (file_key, line_num, idx, ts, tool_name, is_error) "
+            "SELECT f.file_key, 9000 + i, 0, "
+            "       TIMESTAMPTZ '2026-03-04 05:06:07+00' + make_interval(hours => i), "
+            "       CASE WHEN mod(i, 2) = 0 THEN 'Read' ELSE 'Bash' END, "
+            "       CASE WHEN mod(i, 5) = 0 THEN TRUE "
+            "            WHEN mod(i, 7) = 0 THEN NULL ELSE FALSE END "
+            "FROM files f, generate_series(1, 30) AS i "
+            "WHERE f.file_key = (SELECT MIN(file_key) FROM files)"
+        )
+        conn.commit()
+
+    from backend import ingest
+    ingest.rebuild_tool_rollup()
+
+
+def test_tool_endpoints_rollup_matches_live_path(app_with_fresh_data, monkeypatch):
+    """tool_rollup must return exactly what the live per-call query does."""
+    from backend import api as api_mod
+    from backend import cache
+
+    _insert_tool_probe_rows()
+
+    rolled_usage = app_with_fresh_data.get("/api/tool-usage?range=3650d").json()
+    rolled_errors = app_with_fresh_data.get("/api/tool-error-rate?range=3650d").json()
+    assert rolled_usage["buckets"], "probe rows must reach /api/tool-usage"
+    assert rolled_errors["buckets"], "probe rows must reach /api/tool-error-rate"
+    # Unsettled calls exist, so the two endpoints must NOT see the same totals.
+    assert (sum(b["n"] for b in rolled_usage["buckets"])
+            > sum(b["n_total"] for b in rolled_errors["buckets"]))
+
+    live_source = api_mod._tool_source(60)      # the live subquery branch
+    monkeypatch.setattr(api_mod, "_tool_source", lambda bucket_s: live_source)
+    cache.response_cache.clear()
+    live_usage = app_with_fresh_data.get("/api/tool-usage?range=3650d").json()
+    live_errors = app_with_fresh_data.get("/api/tool-error-rate?range=3650d").json()
+
+    assert rolled_usage["buckets"] == live_usage["buckets"]
+    assert rolled_errors["buckets"] == live_errors["buckets"]
