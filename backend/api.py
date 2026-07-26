@@ -1170,6 +1170,10 @@ def dashboard(
 
     _t_sql = time.perf_counter()
     with db.viz_conn() as c:
+        # The rollups removed this endpoint's biggest sorts, but ctx_traces
+        # and response_sizes still sort/aggregate over raw rows, and the
+        # default work_mem spills them to disk on a wide range.
+        c.execute("SET LOCAL work_mem = '64MB'")
         hourly_rows = ph.execute(
             "hourly", c,
             f"""
