@@ -12,7 +12,7 @@ The dashboard panels include: Session Burn Rate, Cost by Model, Token Breakdown,
 
 - **Backend**: Python 3.13+, FastAPI, Uvicorn, psycopg3 (with connection pooling)
 - **Frontend**: React 18 (loaded from CDN), in-browser Babel transpilation, vanilla JS/JSX — no webpack, vite, or npm install
-- **Database**: PostgreSQL (two separate DBs: `kimi_viz` for app data, external auth DB for user credentials)
+- **Database**: PostgreSQL (two separate DBs: `kimimeter` for app data, external auth DB for user credentials)
 - **Object storage**: Cloudflare R2 via S3-compatible API, or local filesystem mirror (`file://`)
 - **Scheduling**: APScheduler (BackgroundScheduler) for hourly ingest
 - **Serialization**: orjson for fast JSON parsing
@@ -65,8 +65,8 @@ examples/         — Sample systemd service file
 
 ```bash
 # 1. Create the app database and apply schema
-createdb kimi_viz
-psql kimi_viz -f backend/schema.sql
+createdb kimimeter
+psql kimimeter -f backend/schema.sql
 
 # 2. Configure environment
 cp backend/.env.example .env

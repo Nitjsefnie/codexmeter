@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _build_app(monkeypatch, pre_ingest=None, test_db="kimi_viz_test_api"):
+def _build_app(monkeypatch, pre_ingest=None, test_db="kimimeter_test_api"):
     """Spin up a fresh DB + mini R2, optionally mutate the temp R2 tree,
     ingest, and yield a TestClient on the api router — then tear it down.
 
@@ -76,7 +76,7 @@ def app_with_fresh_data():
     contaminate the shared module-scoped client."""
     mp = pytest.MonkeyPatch()
     try:
-        yield from _build_app(mp, test_db="kimi_viz_test_api_mut")
+        yield from _build_app(mp, test_db="kimimeter_test_api_mut")
     finally:
         mp.undo()
 
@@ -120,7 +120,7 @@ def app_with_unresolved():
     mp = pytest.MonkeyPatch()
     try:
         yield from _build_app(
-            mp, pre_ingest=_inject_junk, test_db="kimi_viz_test_unres"
+            mp, pre_ingest=_inject_junk, test_db="kimimeter_test_unres"
         )
     finally:
         mp.undo()
@@ -538,3 +538,30 @@ def test_tool_endpoints_rollup_matches_live_path(app_with_fresh_data, monkeypatc
 
     assert rolled_usage["buckets"] == live_usage["buckets"]
     assert rolled_errors["buckets"] == live_errors["buckets"]
+
+
+def test_dashboard_model_filter_does_not_500(app_with_data):
+    """?model= must filter, not raise.
+
+    The queries that read `files` (file_counts, ctx_traces, ctx_lines,
+    rate_limits) carry no model placeholder, but were handed the same arg
+    list as the model-filtered ones — one argument more than the statement
+    had placeholders, so every ?model= request raised. Both the rollup
+    path (wide buckets) and the live path (24h, 5-minute buckets) are
+    exercised, since they build their args separately.
+    """
+    unfiltered = app_with_data.get("/api/dashboard?range=3650d").json()
+    present = sorted({h["model"] for h in unfiltered["hourly"]})
+    assert present, "fixture must produce at least one model"
+
+    for rng in ("3650d", "1d"):
+        # A model the fixture DOES have: 200, and nothing else leaks in.
+        r = app_with_data.get(f"/api/dashboard?range={rng}&model={present[0]}")
+        assert r.status_code == 200, f"range={rng}: {r.status_code} {r.text[:200]}"
+        assert {h["model"] for h in r.json()["hourly"]} <= {present[0]}
+
+        # A model it does NOT: also 200, and empty — proving the filter is
+        # applied rather than ignored, which one model alone cannot show.
+        r = app_with_data.get(f"/api/dashboard?range={rng}&model=no-such-model")
+        assert r.status_code == 200, f"range={rng}: {r.status_code} {r.text[:200]}"
+        assert r.json()["hourly"] == []

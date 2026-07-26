@@ -21,7 +21,7 @@
     external auth DB's `users.config`, HMAC-signed session cookies, plus
     a guest-mode sentinel (`user_id=0`, per-process secret).
   - `events.py` — thread-safe SSE broadcaster.
-  - `db.py` — two psycopg pools: `viz_pool` (kimi_viz) and `auth_pool`
+  - `db.py` — two psycopg pools: `viz_pool` (kimimeter) and `auth_pool`
     (read-only auth DB). Pools never join across DBs.
   - `cache.py` — in-memory LRU for raw transcript bytes.
   - `schema.sql` — idempotent `CREATE TABLE IF NOT EXISTS` + safe

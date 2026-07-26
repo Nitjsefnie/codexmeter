@@ -1099,6 +1099,12 @@ def dashboard(
     model_filter = ""
     args: list[Any] = [since]
     proj_filter = _proj_filter(project, args)
+    # Snapshot BEFORE the model param is appended. The queries that read
+    # `files` (file_counts, ctx_traces, ctx_lines, rate_limits) have no
+    # model placeholder — handing them the full `args` passed one argument
+    # more than the statement had placeholders, so any ?model= request
+    # raised instead of returning a filtered dashboard.
+    file_args: list[Any] = list(args)
     if model:
         model_filter = "AND r.model LIKE %s"
         args.append(f"%{model}%")
@@ -1214,7 +1220,7 @@ def dashboard(
         ).fetchone()
         total_sessions = int(total_sessions_row[0] or 0) if total_sessions_row else 0
 
-        file_counts_args = list(args)
+        file_counts_args = list(file_args)
         file_counts_row = ph.execute(
             "file_counts", c,
             f"""
@@ -1313,7 +1319,7 @@ def dashboard(
         # treats each file as its own conversation, so a sub-agent
         # invocation surfaces under whatever model it ran on, even if
         # there's no main session file on disk.
-        ctx_traces_args = list(args)
+        ctx_traces_args = list(file_args)
         ctx_traces_rows = ph.execute(
             "ctx_traces", c,
             f"""
@@ -1347,7 +1353,7 @@ def dashboard(
             ctx_traces_args,
         ).fetchall()
 
-        rl_args = list(args)
+        rl_args = list(file_args)
         rl_rows = ph.execute(
             "rate_limits", c,
             f"""
@@ -1365,11 +1371,14 @@ def dashboard(
     # rather than costing their own full pass over the records.
     cost_by_model_acc: dict[str, float] = {}
     for row in hourly_rows:
-        (hour, model, input_t, output_t, cr, cost, reqs, sc) = row
+        # NOT `model` — that is the request's filter, and rebinding it here
+        # would make the TIMING line report the last row's model as the one
+        # that was asked for.
+        (hour, row_model, input_t, output_t, cr, cost, reqs, sc) = row
         hour_iso = _iso(hour)
         is_first_for_hour = hour_iso not in seen_hours
         seen_hours.add(hour_iso)
-        model_name = model or "unknown"
+        model_name = row_model or "unknown"
         hourly.append({
             "hour": hour_iso,
             "model": model_name,

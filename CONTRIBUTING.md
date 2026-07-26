@@ -57,8 +57,8 @@ Requires **Python 3.13+** and a local **PostgreSQL** you can create
 databases in.
 
 ```bash
-createdb kimi_viz
-psql kimi_viz -f backend/schema.sql
+createdb kimimeter
+psql kimimeter -f backend/schema.sql
 
 cp backend/.env.example .env      # then edit: DATABASE_URL_VIZ, R2_*, ADMIN_TOKEN
 python3 -m venv .venv && . .venv/bin/activate
