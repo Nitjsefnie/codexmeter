@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import tempfile
@@ -322,9 +323,10 @@ def test_pool_and_sequential_ingest_agree(fresh_db, mini_r2_env, monkeypatch):
 
 # ------------------------------------------- per-object R2 failures (#3)
 
-def _patch_fetch(monkeypatch, key, fail_times):
+def _patch_fetch(monkeypatch, key, fail_times, exc=None):
     """Make r2.get_object fail for `key` on its first `fail_times` calls.
 
+    `exc` is the exception to raise, defaulting to a plain OSError.
     Returns (call_counts, slept) — the per-key GET count (the pooled path
     calls this from several threads, hence the lock) and the backoff sleeps
     the retry asked for, which are swallowed so the suite does not pay them.
@@ -339,7 +341,7 @@ def _patch_fetch(monkeypatch, key, fail_times):
             counts[k] += 1
             n = counts[k]
         if k == key and n <= fail_times:
-            raise OSError(f"connection reset while fetching {k}")
+            raise exc or OSError(f"connection reset while fetching {k}")
         return real_get(k)
 
     monkeypatch.setattr(ingest.r2, "get_object", flaky)
@@ -497,6 +499,84 @@ def test_a_parse_failure_is_not_retried(fresh_db, mini_r2_env, monkeypatch):
     assert result["failed"] == 1
     assert result["inserted"] == 4
     assert "ValueError" not in (result["error"] or "")
+
+
+_MARKER_KEY = "sessions/projA/project.json"
+
+
+def _write_marker(mini_r2_env, path="/root/work/projA"):
+    """The mini mirror carries no project.json; production has 228 of them."""
+    marker = mini_r2_env / "sessions" / "projA" / "project.json"
+    marker.write_text(json.dumps({"path": path}))
+    return marker
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_a_failed_marker_fetch_does_not_abort_the_run(
+    fresh_db, mini_r2_env, monkeypatch, workers
+):
+    """Marker GETs are as droppable as wire GETs, and fail earlier.
+
+    The boto3 transients are NOT OSErrors — ConnectionClosedError, the one
+    issue #3 was filed about, is a BotoCoreError — so _fetch_marker's narrow
+    catch never saw them and the exception escaped the collection step
+    before r2_listed had even been counted.
+    """
+    from botocore.exceptions import ConnectionClosedError
+
+    _write_marker(mini_r2_env)
+    monkeypatch.setenv("INGEST_WORKERS", str(workers))
+    boom = ConnectionClosedError(endpoint_url="https://acct.r2.cloudflarestorage.com")
+    assert not isinstance(boom, OSError), "the point of the fixture"
+    counts = _patch_fetch(monkeypatch, _MARKER_KEY, fail_times=99, exc=boom)[0]
+
+    result = ingest.run_ingest(trigger="manual")
+
+    assert result["failed"] == 1
+    assert result["error"] == f"1 object failed after retries: {_MARKER_KEY}"
+    assert result["r2_listed"] == 5, "the wire objects were still listed"
+    assert result["inserted"] == 5, "and still persisted"
+    assert counts[_MARKER_KEY] == ingest.FETCH_ATTEMPTS, "the GET is retried"
+    with db.viz_conn() as c:
+        rollup = c.execute("SELECT COUNT(*) FROM usage_rollup").fetchone()[0]
+        display = c.execute(
+            "SELECT display_name FROM projects WHERE project_id = 'projA'"
+        ).fetchone()[0]
+    assert rollup > 0, "derived state must still be rebuilt"
+    assert display == "projA", "an unreadable marker degrades to the id"
+
+
+def test_a_malformed_marker_degrades_without_counting_as_a_failure(
+    fresh_db, mini_r2_env
+):
+    """Decode/shape problems are not fetch failures: no retry would help,
+    and the project simply shows its id instead of its path."""
+    marker = _write_marker(mini_r2_env)
+    marker.write_text("{not json at all")
+
+    result = ingest.run_ingest(trigger="manual")
+
+    assert result["failed"] == 0
+    assert result["error"] is None
+    with db.viz_conn() as c:
+        display = c.execute(
+            "SELECT display_name FROM projects WHERE project_id = 'projA'"
+        ).fetchone()[0]
+    assert display == "projA"
+
+
+def test_a_readable_marker_still_names_the_project(fresh_db, mini_r2_env):
+    """Guard the happy path the retry/collect rework runs through."""
+    _write_marker(mini_r2_env, path="/root/work/projA")
+
+    result = ingest.run_ingest(trigger="manual")
+
+    assert result["failed"] == 0
+    with db.viz_conn() as c:
+        display = c.execute(
+            "SELECT display_name FROM projects WHERE project_id = 'projA'"
+        ).fetchone()[0]
+    assert display == "/root/work/projA"
 
 
 def test_failure_summary_truncates_a_long_key_list():

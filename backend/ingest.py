@@ -95,19 +95,15 @@ def run_ingest(trigger: str) -> dict:
         # populated before the wire-object loop starts.
         project_paths: dict[str, str] = {}
         if marker_items:
-            if workers == 1:
-                marker_results = [
-                    _fetch_marker(project_id, key)
-                    for project_id, key in marker_items
-                ]
-            else:
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = {
-                        pool.submit(_fetch_marker, project_id, key): (project_id, key)
-                        for project_id, key in marker_items
-                    }
-                    marker_results = [f.result() for f in as_completed(futures)]
-            for res in marker_results:
+            # A marker GET is as droppable as a wire GET — and failing one
+            # used to abort the run even earlier, before r2_listed had been
+            # counted. Same collector, same `failed` list, one summary.
+            for item, res, exc in _resolve(
+                marker_items, lambda it: _fetch_marker(*it), workers
+            ):
+                if exc is not None:
+                    _record_failure(failed, item[1], exc)
+                    continue
                 if res is not None:
                     project_paths[res[0]] = res[1]
 
@@ -160,40 +156,12 @@ def run_ingest(trigger: str) -> dict:
         chunk = max(1, workers * 4)
         for start in range(0, len(todo), chunk):
             batch = todo[start:start + chunk]
-            # (item, parsed, exc) per file. Each fetch+parse is resolved
-            # HERE, paired with its own exception, so one bad object costs
-            # one object: letting f.result() raise out of the collection
-            # step aborted the whole ingest and discarded every already
-            # fetched result in the chunk along with it.
-            outcomes: list[tuple[tuple, dict | None, Exception | None]] = []
-            if workers == 1:
-                for item in batch:
-                    try:
-                        outcomes.append(
-                            (item, _fetch_and_parse(item[0].key), None)
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        outcomes.append((item, None, e))
-            else:
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = {
-                        pool.submit(_fetch_and_parse, item[0].key): item
-                        for item in batch
-                    }
-                    for f in as_completed(futures):
-                        item = futures[f]
-                        try:
-                            outcomes.append((item, f.result(), None))
-                        except Exception as e:  # noqa: BLE001
-                            outcomes.append((item, None, e))
-            for item, parsed, exc in outcomes:
+            for item, parsed, exc in _resolve(
+                batch, lambda it: _fetch_and_parse(it[0].key), workers
+            ):
                 obj, proj, project_id, session_id, is_main, stored = item
                 if exc is not None:
-                    failed.append((obj.key, f"{type(exc).__name__}: {exc}"))
-                    log.warning(
-                        "ingest: %s failed after %d attempt(s): %s: %s",
-                        obj.key, FETCH_ATTEMPTS, type(exc).__name__, exc,
-                    )
+                    _record_failure(failed, obj.key, exc)
                     continue
                 _persist(
                     obj, proj, project_id, session_id, is_main,
@@ -291,6 +259,48 @@ def run_ingest(trigger: str) -> dict:
     if fatal is None:
         warm_common()
     return summary
+
+
+def _resolve(items: list, call, workers: int) -> list[tuple]:
+    """Run `call(item)` over `items`, pairing each with its result OR its
+    exception instead of letting the first failure escape.
+
+    Sequential when workers == 1, on a pool otherwise. Both marker and wire
+    fetches go through here: collecting with `[f.result() for f in
+    as_completed(...)]` re-raised the worker's exception out of the
+    collection step, which aborted the whole ingest AND discarded every
+    already-fetched result alongside it. The two shapes have to behave
+    identically, which is easiest to guarantee with one implementation.
+
+    Returns [(item, result, None) | (item, None, exception)].
+    """
+    outcomes: list[tuple] = []
+    if workers == 1:
+        for item in items:
+            try:
+                outcomes.append((item, call(item), None))
+            except Exception as e:  # noqa: BLE001
+                outcomes.append((item, None, e))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(call, item): item for item in items}
+            for f in as_completed(futures):
+                item = futures[f]
+                try:
+                    outcomes.append((item, f.result(), None))
+                except Exception as e:  # noqa: BLE001
+                    outcomes.append((item, None, e))
+    return outcomes
+
+
+def _record_failure(failed: list[tuple[str, str]], key: str,
+                    exc: BaseException) -> None:
+    """Book one object as failed and say so in the log."""
+    failed.append((key, f"{type(exc).__name__}: {exc}"))
+    log.warning(
+        "ingest: %s failed after %d attempt(s): %s: %s",
+        key, FETCH_ATTEMPTS, type(exc).__name__, exc,
+    )
 
 
 def _failure_summary(failed: list[tuple[str, str]]) -> str | None:
@@ -606,14 +616,22 @@ def _fetch_marker(project_id: str, key: str) -> tuple[str, str] | None:
     """Fetch and parse a sessions/<hash>/project.json marker on a pool thread.
 
     Runs on a pool thread and touches no DB connection.
+
+    The GET is retried and its failure is left to PROPAGATE, so the caller
+    books it as a per-object failure like any wire object. Only decode and
+    shape problems are swallowed here: a malformed marker means that
+    project shows its id instead of its path, which is a degrade, not a
+    failed fetch, and no retry would change it.
     """
+    blob = _fetch_with_retry(key)
     try:
-        blob = r2.get_object(key)
         data = json.loads(blob.decode("utf-8"))
         path = data.get("path")
         if isinstance(path, str) and path:
             return (project_id, path)
-    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+    except (ValueError, KeyError, AttributeError):
+        # ValueError covers UnicodeDecodeError and json.JSONDecodeError;
+        # AttributeError covers a marker whose top level is not an object.
         pass
     return None
 
