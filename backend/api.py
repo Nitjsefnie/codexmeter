@@ -130,6 +130,22 @@ def _proj_filter(project: str | None, args: list) -> str:
     return "AND f.project_id = %s"
 
 
+def _proj_semijoin(project: str | None, args: list) -> str:
+    """Same filter as `_proj_filter`, expressed as a semi-join on `records`
+    with no `files` alias in scope. Queries that select a bare `file_key`
+    need this: joining `files` in would make that column reference
+    ambiguous."""
+    if not project:
+        return ""
+    if project == UNRESOLVED_PROJECT_ID:
+        return (
+            "AND file_key IN (SELECT file_key FROM files WHERE project_id IN "
+            f"(SELECT project_id FROM projects WHERE {_unresolved_cond()}))"
+        )
+    args.append(project)
+    return "AND file_key IN (SELECT file_key FROM files WHERE project_id = %s)"
+
+
 @router.get("/me")
 def me(request: Request) -> dict:
     """Identity probe — frontend uses `is_guest` to decide which UI
@@ -270,9 +286,8 @@ def activity_heatmap(
 
     dow is ISO (1=Mon … 7=Sun), hour 0–23. DST handled by Postgres
     tzdata via AT TIME ZONE — UTC+1 in winter (CET), UTC+2 in summer
-    (CEST). Cross-file uuid dedup at read time, mirroring /api/dashboard
-    (SV-PARSER-SPEC). Unlike dashboard's dedup_body, the model filter is
-    applied to BOTH arms so uuid-less legacy rows also honour it."""
+    (CEST). Cross-file uuid dedup comes from records.is_canonical, resolved
+    at ingest (SV-CANONICAL-FLAG)."""
     delta = _parse_range(range)
     since = datetime.now(timezone.utc) - delta
 
@@ -282,31 +297,23 @@ def activity_heatmap(
     if model:
         model_filter = "AND r.model LIKE %s"
         filt_args.append(f"%{model}%")
-    args = [HEATMAP_TZ, HEATMAP_TZ] + filt_args + filt_args
-
-    dedup_body = f"""
-      (SELECT DISTINCT ON (r.uuid) r.ts, r.output_tokens, r.cost_usd
-       FROM records r
-       JOIN files f ON f.file_key = r.file_key
-       WHERE r.ts >= %s {proj_filter} {model_filter} AND r.uuid IS NOT NULL
-       ORDER BY r.uuid, r.file_key)
-      UNION ALL
-      (SELECT r.ts, r.output_tokens, r.cost_usd
-       FROM records r
-       JOIN files f ON f.file_key = r.file_key
-       WHERE r.ts >= %s {proj_filter} {model_filter} AND r.uuid IS NULL)
-    """
+    args = [HEATMAP_TZ, HEATMAP_TZ] + filt_args
+    # The JOIN exists only to resolve project_id; without a project filter
+    # it is a join against every file for nothing.
+    join_files = "JOIN files f ON f.file_key = r.file_key" if proj_filter else ""
 
     with db.viz_conn() as c:
         rows = c.execute(
             f"""
-            SELECT EXTRACT(ISODOW FROM (d.ts AT TIME ZONE %s))::int AS dow,
-                   EXTRACT(HOUR   FROM (d.ts AT TIME ZONE %s))::int AS hour,
+            SELECT EXTRACT(ISODOW FROM (r.ts AT TIME ZONE %s))::int AS dow,
+                   EXTRACT(HOUR   FROM (r.ts AT TIME ZONE %s))::int AS hour,
                    COUNT(*)             AS requests,
-                   SUM(d.output_tokens) AS output_tokens,
-                   SUM(d.cost_usd)      AS cost_usd
-            FROM ({dedup_body}) d
-            WHERE d.ts IS NOT NULL
+                   SUM(r.output_tokens) AS output_tokens,
+                   SUM(r.cost_usd)      AS cost_usd
+            FROM records r
+            {join_files}
+            WHERE r.is_canonical AND r.ts >= %s {proj_filter} {model_filter}
+              AND r.ts IS NOT NULL
             GROUP BY 1, 2
             ORDER BY 1, 2
             """,
@@ -611,8 +618,9 @@ def cache_view(
         top_cache_read: [...]
       }
 
-    Cross-file uuid dedup via DISTINCT ON (uuid) at query time. Records
-    with NULL uuid (legacy) are kept verbatim (UNION ALL leg).
+    Cross-file uuid dedup comes from records.is_canonical, resolved at
+    ingest (SV-CANONICAL-FLAG). Records with NULL uuid (legacy) are always
+    canonical, matching the old UNION ALL leg that kept them verbatim.
 
     Kimi wire format never emits input_cache_creation > 0, so cache_create /
     create buckets are dropped from the response entirely.
@@ -620,74 +628,67 @@ def cache_view(
     delta = _parse_range(range)
     since = datetime.now(timezone.utc) - delta
     model_filter = ""
-    leg_args: list[Any] = [since]
-    proj_filter = _proj_filter(project, leg_args)
+    canon_args: list[Any] = [since]
+    proj_filter = _proj_semijoin(project, canon_args)
     if model:
-        model_filter = "AND r.model LIKE %s"
-        leg_args.append(f"%{model}%")
-    args = list(leg_args)
-    args2 = leg_args + leg_args  # filters applied twice (one per UNION leg)
-
-    base_cte = f"""
-    WITH deduped AS (
-      (SELECT DISTINCT ON (r.uuid) r.*
-       FROM records r
-       JOIN files f ON f.file_key = r.file_key
-       WHERE r.ts >= %s {proj_filter} {model_filter} AND r.uuid IS NOT NULL
-       ORDER BY r.uuid, r.file_key)
-      UNION ALL
-      (SELECT r.*
-       FROM records r
-       JOIN files f ON f.file_key = r.file_key
-       WHERE r.ts >= %s {proj_filter} {model_filter} AND r.uuid IS NULL)
-    )
-    """
+        model_filter = "AND model LIKE %s"
+        canon_args.append(f"%{model}%")
 
     ph = Phases("cache_view")
+
+    # Dedup used to be a CTE prefixed onto each of the three queries below,
+    # so Postgres re-ran the whole DISTINCT ON — the single most expensive
+    # step — once per query. It is now resolved at ingest into
+    # records.is_canonical (ingest.recompute_canonical), so each query just
+    # filters a boolean.
+    canon_src = f"""
+        FROM records
+        WHERE ts >= %s AND is_canonical {proj_filter} {model_filter}
+    """
 
     with db.viz_conn() as c:
         per_model_rows = ph.execute(
             "per_model", c,
-            base_cte + """
+            f"""
             SELECT model,
                    COUNT(*)                    AS turns,
                    SUM(fresh_tokens)           AS fresh,
                    SUM(cache_read_tokens)      AS cache_read,
                    SUM(output_tokens)          AS output,
                    SUM(cost_usd)               AS cost_total
-            FROM deduped
+            {canon_src}
             GROUP BY model
             ORDER BY cost_total DESC
             """,
-            args2,
+            canon_args,
         ).fetchall()
 
         top_output = ph.execute(
             "top_output", c,
-            base_cte + """
+            f"""
             SELECT ts, line_num, model,
                    output_tokens, cache_read_tokens,
                    fresh_tokens, cost_usd, file_key
-            FROM deduped
+            {canon_src}
             ORDER BY output_tokens DESC
             LIMIT 10
             """,
-            args2,
+            canon_args,
         ).fetchall()
 
         top_read = ph.execute(
             "top_read", c,
-            base_cte + """
+            f"""
             SELECT ts, line_num, model,
                    cache_read_tokens,
                    output_tokens, fresh_tokens,
                    cost_usd, file_key
-            FROM deduped
-            WHERE cache_read_tokens > 0
+            {canon_src}
+              AND cache_read_tokens > 0
             ORDER BY cache_read_tokens DESC
             LIMIT 10
             """,
-            args2,
+            canon_args,
         ).fetchall()
 
     def _per_model(row):
@@ -960,8 +961,8 @@ def dashboard(
 ) -> dict:
     """Hourly aggregates + per-session burns + per-session ctx_lines.
 
-    Cross-file uuid dedup at query time via DISTINCT ON; legacy NULL-uuid
-    rows are kept verbatim. `model=opus-4-7` filters the deduped CTE
+    Cross-file uuid dedup comes from records.is_canonical, resolved at
+    ingest (SV-CANONICAL-FLAG). `model=opus-4-7` filters the deduped CTE
     so every CTE-derived panel (hourly, cost_by_model, response_sizes,
     sessions, ctx_traces) is constrained to records matching the model
     substring."""
@@ -969,33 +970,28 @@ def dashboard(
     since = datetime.now(timezone.utc) - delta
     bucket_s = _bucket_seconds(delta)
     model_filter = ""
-    leg_args: list[Any] = [since]
-    proj_filter = _proj_filter(project, leg_args)
+    args: list[Any] = [since]
+    proj_filter = _proj_filter(project, args)
     if model:
         model_filter = "AND r.model LIKE %s"
-        leg_args.append(f"%{model}%")
-    args = list(leg_args)
-    args2 = leg_args + leg_args  # filters applied twice (one per UNION leg)
+        args.append(f"%{model}%")
+    # The JOIN exists only to resolve project_id; without a project filter
+    # it is a join against every file for nothing.
+    join_files = "JOIN files f ON f.file_key = r.file_key" if proj_filter else ""
 
+    # One scan filtering a boolean, where this used to be a DISTINCT ON
+    # sort over the whole table UNION ALL'd with the NULL-uuid leg. The
+    # model filter now applies to NULL-uuid rows too — the old NULL leg
+    # silently exempted them.
     base_cte = f"""
     WITH deduped AS (
-      (SELECT DISTINCT ON (r.uuid)
-         r.file_key, r.line_num, r.uuid, r.ts, r.model,
-         r.fresh_tokens, r.cache_read_tokens,
-         r.output_tokens, r.cost_usd,
-         r.text_chars
-       FROM records r
-       JOIN files f ON f.file_key = r.file_key
-       WHERE r.ts >= %s {proj_filter} {model_filter} AND r.uuid IS NOT NULL
-       ORDER BY r.uuid, r.file_key)
-      UNION ALL
-      (SELECT r.file_key, r.line_num, r.uuid, r.ts, r.model,
-              r.fresh_tokens, r.cache_read_tokens,
-              r.output_tokens, r.cost_usd,
-              r.text_chars
-       FROM records r
-       JOIN files f ON f.file_key = r.file_key
-       WHERE r.ts >= %s {proj_filter} AND r.uuid IS NULL)
+      SELECT r.file_key, r.line_num, r.uuid, r.ts, r.model,
+             r.fresh_tokens, r.cache_read_tokens,
+             r.output_tokens, r.cost_usd,
+             r.text_chars
+      FROM records r
+      {join_files}
+      WHERE r.is_canonical AND r.ts >= %s {proj_filter} {model_filter}
     )
     """
 
@@ -1021,7 +1017,7 @@ def dashboard(
             GROUP BY 1, 2
             ORDER BY 1, 2
             """,
-            args2,
+            args,
         ).fetchall()
 
         cost_by_model_rows = ph.execute(
@@ -1033,7 +1029,7 @@ def dashboard(
             GROUP BY 1
             ORDER BY 2 DESC
             """,
-            args2,
+            args,
         ).fetchall()
 
         total_sessions_row = ph.execute(
@@ -1044,7 +1040,7 @@ def dashboard(
             JOIN files f ON f.file_key = d.file_key
             WHERE d.ts IS NOT NULL
             """,
-            args2,
+            args,
         ).fetchone()
         total_sessions = int(total_sessions_row[0] or 0) if total_sessions_row else 0
 
@@ -1120,7 +1116,7 @@ def dashboard(
             ORDER BY SUM(d.cost_usd) DESC NULLS LAST
             LIMIT 500
             """,
-            args2,
+            args,
         ).fetchall()
 
         # Response-size time series per model — daily-bucketed
@@ -1146,7 +1142,7 @@ def dashboard(
             GROUP BY 1, 2
             ORDER BY 1, 2
             """,
-            args2,
+            args,
         ).fetchall()
 
         ctx_turns_args = list(args)
@@ -1445,6 +1441,7 @@ def list_sessions(
     """
     args: list[Any] = []
     proj_filter = _proj_filter(project, args)
+    join_files = "JOIN files f ON f.file_key = r.file_key" if proj_filter else ""
 
     cursor_clause = ""
     if cursor:
@@ -1461,21 +1458,18 @@ def list_sessions(
     # with cross-file uuid dedup, mirroring /api/dashboard. Sub-agent
     # tokens/cost roll up into the parent session's totals; the session
     # is keyed by session_id (shared between main + its agent files).
+    # The dedup leg used to be interpolated twice (one per UNION arm) from
+    # a `proj_filter` whose bind param was appended once — so a project
+    # filter here produced two placeholders for one argument. Collapsing to
+    # a single is_canonical scan removes the second interpolation and the
+    # mismatch with it.
     sql = f"""
     WITH deduped AS (
-      (SELECT DISTINCT ON (r.uuid)
-         r.file_key, r.uuid, r.ts, r.model,
-         r.fresh_tokens, r.cache_read_tokens,
-         r.output_tokens, r.cost_usd
-       FROM records r JOIN files f ON f.file_key = r.file_key
-       WHERE r.uuid IS NOT NULL {proj_filter}
-       ORDER BY r.uuid, r.file_key)
-      UNION ALL
-      (SELECT r.file_key, r.uuid, r.ts, r.model,
-              r.fresh_tokens, r.cache_read_tokens,
-              r.output_tokens, r.cost_usd
-       FROM records r JOIN files f ON f.file_key = r.file_key
-       WHERE r.uuid IS NULL {proj_filter})
+      SELECT r.file_key, r.uuid, r.ts, r.model,
+             r.fresh_tokens, r.cache_read_tokens,
+             r.output_tokens, r.cost_usd
+      FROM records r {join_files}
+      WHERE r.is_canonical {proj_filter}
     ),
     per_session AS (
       SELECT f.session_id,
