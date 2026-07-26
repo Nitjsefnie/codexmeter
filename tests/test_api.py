@@ -397,9 +397,13 @@ def test_dashboard_response_is_cached_and_fresh_bypasses(app_with_fresh_data):
     cache.response_cache.clear()
     first = app_with_fresh_data.get("/api/dashboard?range=all").json()
 
-    # Mutate the DB underneath the cache: delete every record.
+    # Mutate the DB underneath the cache: delete every record. usage_rollup
+    # is derived state that ingest rebuilds from `records`, so emptying the
+    # data means emptying both — leaving the rollup behind would just be
+    # reading a stale pre-aggregate, which is not what this test is about.
     with db.viz_conn() as c:
         c.execute("DELETE FROM records")
+        c.execute("DELETE FROM usage_rollup")
 
     cached = app_with_fresh_data.get("/api/dashboard?range=all").json()
     assert cached == first                       # stale-but-cached payload

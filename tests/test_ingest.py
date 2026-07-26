@@ -200,6 +200,43 @@ def test_recompute_canonical_is_idempotent(fresh_db, mini_r2_env):
     assert ingest.recompute_canonical() == 0
 
 
+def test_usage_rollup_matches_the_records_aggregate(fresh_db, mini_r2_env):
+    """The rollup is derived state serving the dashboard's totals, so it
+    must sum to exactly what the canonical records do. Anything else is a
+    silently wrong number on screen."""
+    ingest.run_ingest(trigger="manual")
+
+    with db.viz_conn() as c:
+        rolled = c.execute(
+            "SELECT SUM(requests), SUM(fresh_tokens), SUM(output_tokens), "
+            "       SUM(cache_read_tokens), ROUND(SUM(cost_usd), 6), "
+            "       COUNT(DISTINCT session_id) "
+            "FROM usage_rollup"
+        ).fetchone()
+        raw = c.execute(
+            "SELECT COUNT(*), SUM(r.fresh_tokens), SUM(r.output_tokens), "
+            "       SUM(r.cache_read_tokens), ROUND(SUM(r.cost_usd), 6), "
+            "       COUNT(DISTINCT f.session_id) "
+            "FROM records r JOIN files f ON f.file_key = r.file_key "
+            "WHERE r.is_canonical AND r.ts IS NOT NULL"
+        ).fetchone()
+
+    assert rolled == raw
+    assert raw is not None and raw[0] > 0, "fixture produced no records"
+
+
+def test_rebuild_rollup_is_a_full_replace(fresh_db, mini_r2_env):
+    """A rebuild must not accumulate: it TRUNCATEs first, because cross-file
+    dedup can demote a record another file already contributed."""
+    ingest.run_ingest(trigger="manual")
+    with db.viz_conn() as c:
+        before = c.execute("SELECT COUNT(*) FROM usage_rollup").fetchone()
+    ingest.rebuild_rollup()
+    with db.viz_conn() as c:
+        after = c.execute("SELECT COUNT(*) FROM usage_rollup").fetchone()
+    assert before == after
+
+
 def test_ingest_marks_response_cache_stale(fresh_db, mini_r2_env):
     """Ingest marks cached responses stale but leaves them SERVABLE.
 

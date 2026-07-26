@@ -995,34 +995,84 @@ def dashboard(
     )
     """
 
+    # Pre-aggregated source for everything that is a pure sum/count/min/max.
+    # `usage_rollup` is grain (session_id, hour, model) and is rebuilt at
+    # ingest, so the panels below read numbers that are already summed
+    # instead of re-aggregating every canonical record on each request.
+    #
+    # It is only usable when the display bucket is at least an hour wide —
+    # the 24h view buckets at 5 minutes, which an hourly rollup cannot
+    # express. For those the live subquery below is shaped with the SAME
+    # column names, so every query after this point is written once.
+    use_rollup = bucket_s >= 3600
+    roll_proj = "AND u.project_id = %s" if project else ""
+    roll_model = "AND u.model LIKE %s" if model else ""
+    if use_rollup:
+        roll_from = "usage_rollup u"
+        # date_trunc so the partial hour containing `since` is included
+        # rather than silently dropped.
+        roll_since = "u.hour >= date_trunc('hour', %s::timestamptz)"
+    else:
+        roll_from = """(
+          SELECT f.session_id, f.project_id, f.is_main,
+                 r.ts AS hour, r.ts AS first_ts, r.ts AS last_ts,
+                 COALESCE(NULLIF(r.model, ''), 'unknown') AS model,
+                 1::bigint AS requests,
+                 r.fresh_tokens, r.output_tokens,
+                 r.cache_read_tokens, r.cost_usd
+            FROM records r
+            JOIN files f ON f.file_key = r.file_key
+           WHERE r.is_canonical AND r.ts IS NOT NULL
+        ) u"""
+        roll_since = "u.hour >= %s"
+    roll_src = f"""
+        FROM {roll_from}
+        WHERE {roll_since} {roll_proj} {roll_model}
+    """
+    roll_args: list[Any] = [since]
+    if project:
+        roll_args.append(project)
+    if model:
+        roll_args.append(f"%{model}%")
+
     ph = Phases("dashboard")
 
     with db.viz_conn() as c:
         hourly_rows = ph.execute(
             "hourly", c,
+            f"""
+            SELECT to_timestamp(
+                     floor(EXTRACT(EPOCH FROM u.hour) / {bucket_s}) * {bucket_s} + {bucket_s} / 2
+                   ) AS hour,
+                   u.model,
+                   SUM(u.fresh_tokens)      AS input_tokens,
+                   SUM(u.output_tokens)     AS output_tokens,
+                   SUM(u.cache_read_tokens) AS cache_read_tokens,
+                   SUM(u.cost_usd)          AS cost_usd,
+                   SUM(u.requests)          AS requests,
+                   COUNT(DISTINCT u.session_id) AS session_count
+            {roll_src}
+            GROUP BY 1, 2
+            ORDER BY 1, 2
+            """,
+            roll_args,
+        ).fetchall()
+
+        # Percentiles are the one thing that cannot be rolled up — p50/p90
+        # of a union of hours is not derivable from per-hour p50/p90 — so
+        # this stays a live pass, narrowed to the text-bearing rows.
+        response_sizes_rows = ph.execute(
+            "response_sizes", c,
             base_cte + f"""
             SELECT to_timestamp(
                      floor(EXTRACT(EPOCH FROM d.ts) / {bucket_s}) * {bucket_s} + {bucket_s} / 2
-                   ) AS hour,
+                   ) AS bucket,
                    COALESCE(NULLIF(d.model, ''), 'unknown') AS model,
-                   SUM(d.fresh_tokens)     AS input_tokens,
-                   SUM(d.output_tokens)    AS output_tokens,
-                   SUM(d.cache_read_tokens) AS cache_read_tokens,
-                   SUM(d.cost_usd)         AS cost_usd,
-                   COUNT(*)                AS requests,
-                   COUNT(DISTINCT f.session_id) AS session_count,
-                   -- Response sizes used to be a SECOND full pass grouped
-                   -- by the same (bucket, model) over the same rows. The
-                   -- percentiles just need the text-bearing subset, which
-                   -- FILTER gives us without a separate scan.
-                   COUNT(*) FILTER (WHERE d.text_chars > 0) AS text_n,
-                   PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY d.text_chars)
-                     FILTER (WHERE d.text_chars > 0) AS text_p50,
-                   PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY d.text_chars)
-                     FILTER (WHERE d.text_chars > 0) AS text_p90
+                   COUNT(*) AS n,
+                   PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY d.text_chars) AS p50,
+                   PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY d.text_chars) AS p90
             FROM deduped d
-            JOIN files f ON f.file_key = d.file_key
-            WHERE d.ts IS NOT NULL
+            WHERE d.text_chars > 0 AND d.ts IS NOT NULL
             GROUP BY 1, 2
             ORDER BY 1, 2
             """,
@@ -1031,13 +1081,11 @@ def dashboard(
 
         total_sessions_row = ph.execute(
             "total_sessions", c,
-            base_cte + """
-            SELECT COUNT(DISTINCT f.session_id) AS n
-            FROM deduped d
-            JOIN files f ON f.file_key = d.file_key
-            WHERE d.ts IS NOT NULL
+            f"""
+            SELECT COUNT(DISTINCT u.session_id) AS n
+            {roll_src}
             """,
-            args,
+            roll_args,
         ).fetchone()
         total_sessions = int(total_sessions_row[0] or 0) if total_sessions_row else 0
 
@@ -1072,48 +1120,54 @@ def dashboard(
         subagent_files         = int(file_counts_row[2] or 0) if file_counts_row else 0
         subagent_only_sessions = int(file_counts_row[3] or 0) if file_counts_row else 0
 
+        # The rollup already carries per-(session, hour, model) sums, so the
+        # dominant model is argmax(requests) over the in-range rows — exactly
+        # what MODE() WITHIN GROUP computed from the raw records, without
+        # re-sorting them.
         sessions_rows = ph.execute(
             "sessions", c,
-            base_cte + """
-            SELECT f.session_id,
-                   EXTRACT(EPOCH FROM MIN(d.ts))::float AS start_ts,
-                   EXTRACT(EPOCH FROM MAX(d.ts))::float AS end_ts,
-                   COUNT(*) AS requests,
-                   SUM(d.fresh_tokens) AS input_tokens,
-                   SUM(d.output_tokens) AS output_tokens,
-                   SUM(d.cache_read_tokens) AS cache_read_tokens,
-                   SUM(d.cost_usd) AS cost_usd,
-                   COALESCE(
-                     -- Prefer the most-common REAL model (anything that
-                     -- isn't empty). Sessions where the
-                     -- only records are sub-agent rows fall
-                     -- back to MODE-with-synthetic so they don't go
-                     -- blank — but any session with even one real model
-                     -- record is labeled by that model.
-                     MODE() WITHIN GROUP (ORDER BY d.model) FILTER (
-                       WHERE d.model <> ''
-                     ),
-                     MODE() WITHIN GROUP (ORDER BY NULLIF(d.model, ''))
-                   ) AS model,
-                   -- Every distinct (real, non-synthetic) model the
-                   -- session actually used — lets per-model panels
-                   -- include a session even when the model isn't the
-                   -- dominant one (e.g. a session that used opus-4-5
-                   -- only briefly still gets counted under opus-4-5).
+            f"""
+            WITH per_session_model AS (
+              SELECT u.session_id, u.model,
+                     SUM(u.requests)          AS requests,
+                     SUM(u.fresh_tokens)      AS input_tokens,
+                     SUM(u.output_tokens)     AS output_tokens,
+                     SUM(u.cache_read_tokens) AS cache_read_tokens,
+                     SUM(u.cost_usd)          AS cost_usd,
+                     MIN(u.first_ts)          AS first_ts,
+                     MAX(u.last_ts)           AS last_ts
+              {roll_src}
+              GROUP BY 1, 2
+            )
+            SELECT session_id,
+                   EXTRACT(EPOCH FROM MIN(first_ts))::float AS start_ts,
+                   EXTRACT(EPOCH FROM MAX(last_ts))::float  AS end_ts,
+                   SUM(requests)          AS requests,
+                   SUM(input_tokens)      AS input_tokens,
+                   SUM(output_tokens)     AS output_tokens,
+                   SUM(cache_read_tokens) AS cache_read_tokens,
+                   SUM(cost_usd)          AS cost_usd,
+                   -- Prefer the most-used REAL model; a session whose rows
+                   -- carry no resolved model still gets a label rather than
+                   -- going blank.
+                   (ARRAY_AGG(model ORDER BY
+                      (model <> 'unknown') DESC,
+                      requests DESC))[1] AS model,
+                   -- Every distinct real model the session used, so
+                   -- per-model panels include a session even when the
+                   -- model isn't the dominant one.
                    ARRAY_REMOVE(
-                     ARRAY_AGG(DISTINCT NULLIF(d.model, '')) FILTER (
-                       WHERE d.model <> ''
+                     ARRAY_AGG(DISTINCT model) FILTER (
+                       WHERE model <> 'unknown'
                      ),
                      NULL
                    ) AS models_used
-            FROM deduped d
-            JOIN files f ON f.file_key = d.file_key
-            WHERE d.ts IS NOT NULL
-            GROUP BY f.session_id
-            ORDER BY SUM(d.cost_usd) DESC NULLS LAST
+            FROM per_session_model
+            GROUP BY session_id
+            ORDER BY SUM(cost_usd) DESC NULLS LAST
             LIMIT 500
             """,
-            args,
+            roll_args,
         ).fetchall()
 
         # Response-size time series per model — daily-bucketed
@@ -1171,35 +1225,35 @@ def dashboard(
             ctx_traces_args,
         ).fetchall()
 
-        burn_args = list(args)
+        # Was two passes over `records` — a per-file GROUP BY plus a
+        # correlated per-file dominant-model subquery that ran for every
+        # main file in the table, ignoring both range and project. The
+        # rollup carries is_main, per-model request counts and first/last
+        # ts, so both collapse into one grouping over pre-summed rows.
         burn_rows = ph.execute(
             "burn", c,
             f"""
-            WITH per_session AS (
-              SELECT f.session_id, f.file_key,
-                     SUM(r.fresh_tokens) AS write_tokens,
-                     EXTRACT(EPOCH FROM (max(r.ts) - min(r.ts))) AS span_s
-              FROM files f
-              JOIN records r ON r.file_key = f.file_key
-              WHERE f.is_main AND r.ts >= %s {proj_filter}
-              GROUP BY f.session_id, f.file_key
-            ),
-            dom_model AS (
-              SELECT f.session_id,
-                     (SELECT model FROM records r2
-                      WHERE r2.file_key = f.file_key AND r2.model <> ''
-                      GROUP BY model ORDER BY count(*) DESC LIMIT 1) AS model
-              FROM files f WHERE f.is_main
+            WITH per_session_model AS (
+              SELECT u.session_id, u.model,
+                     SUM(u.requests)     AS requests,
+                     SUM(u.fresh_tokens) AS write_tokens,
+                     MIN(u.first_ts)     AS first_ts,
+                     MAX(u.last_ts)      AS last_ts
+              {roll_src} AND u.is_main
+              GROUP BY 1, 2
             )
-            SELECT ps.session_id,
-                   (ps.write_tokens / GREATEST(ps.span_s, 1.0))::float AS tps,
-                   COALESCE(dm.model, '') AS model
-            FROM per_session ps
-            LEFT JOIN dom_model dm ON dm.session_id = ps.session_id
+            SELECT session_id,
+                   (SUM(write_tokens) / GREATEST(
+                      EXTRACT(EPOCH FROM (MAX(last_ts) - MIN(first_ts))), 1.0
+                    ))::float AS tps,
+                   COALESCE((ARRAY_AGG(model ORDER BY
+                     (model <> 'unknown') DESC, requests DESC))[1], '') AS model
+            FROM per_session_model
+            GROUP BY session_id
             ORDER BY tps DESC NULLS LAST
             LIMIT 200
             """,
-            burn_args,
+            roll_args,
         ).fetchall()
 
         ctx_args = list(args)
@@ -1237,10 +1291,8 @@ def dashboard(
     # cost_by_model and response_sizes are folded out of these same rows
     # rather than costing their own full pass over the records.
     cost_by_model_acc: dict[str, float] = {}
-    response_sizes = []
     for row in hourly_rows:
-        (hour, model, input_t, output_t, cr, cost, reqs, sc,
-         text_n, text_p50, text_p90) = row
+        (hour, model, input_t, output_t, cr, cost, reqs, sc) = row
         hour_iso = _iso(hour)
         is_first_for_hour = hour_iso not in seen_hours
         seen_hours.add(hour_iso)
@@ -1258,14 +1310,17 @@ def dashboard(
         cost_by_model_acc[model_name] = (
             cost_by_model_acc.get(model_name, 0.0) + float(cost or 0)
         )
-        if text_n:
-            response_sizes.append({
-                "ts": hour_iso,
-                "model": model_name,
-                "n": int(text_n or 0),
-                "p50": float(text_p50 or 0),
-                "p90": float(text_p90 or 0),
-            })
+
+    response_sizes = [
+        {
+            "ts": _iso(bucket),
+            "model": m,
+            "n": int(n or 0),
+            "p50": float(p50 or 0),
+            "p90": float(p90 or 0),
+        }
+        for (bucket, m, n, p50, p90) in response_sizes_rows
+    ]
 
     burns = []
     for sid, tps, model in burn_rows:
