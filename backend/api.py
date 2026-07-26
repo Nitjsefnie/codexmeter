@@ -1168,6 +1168,7 @@ def dashboard(
 
     ph = Phases("dashboard")
 
+    _t_sql = time.perf_counter()
     with db.viz_conn() as c:
         hourly_rows = ph.execute(
             "hourly", c,
@@ -1365,6 +1366,12 @@ def dashboard(
             rl_args,
         ).fetchall()
 
+    # The per-query labels above only account for time inside execute();
+    # these two bracket everything, so a gap between sql_total and the sum
+    # of the labels is row-fetch time and a large `build` is Python-side.
+    ph.mark("sql_total", time.perf_counter() - _t_sql)
+    _t_build = time.perf_counter()
+
     hourly = []
     seen_hours: set[str | None] = set()
     # cost_by_model and response_sizes are folded out of these same rows
@@ -1456,6 +1463,7 @@ def dashboard(
             "content": (hit or {}).get("content", ""),
         })
 
+    ph.mark("build", time.perf_counter() - _t_build)
     ph.done(range=range, project=project, model=model)
 
     return {

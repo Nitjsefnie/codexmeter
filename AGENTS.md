@@ -54,9 +54,26 @@
   before the hardcoded cutoff are labelled `kimi-k2-6`; newer sessions are
   `kimi-k2-7-code`. `cache_creation` is billed at a flat rate (no TTL split in
   Kimi wire format).
-- **Cross-file uuid dedup happens at READ time** via `DISTINCT ON (uuid)`
-  in `/api/dashboard`, `/api/cache`, etc. There is no persisted Phase 2
-  rollup table.
+- **SV-CANONICAL-FLAG — cross-file uuid dedup is resolved at INGEST.**
+  `records.is_canonical` marks the row that
+  `DISTINCT ON (uuid) ORDER BY uuid, file_key, line_num` would have kept;
+  NULL-uuid rows are always canonical. `ingest.recompute_canonical()`
+  rebuilds it after every successful ingest, because adding or removing a
+  FILE can change which row wins. Read paths filter the boolean — do NOT
+  reintroduce `DISTINCT ON (uuid)` in an endpoint.
+- **SV-ROLLUP — `usage_rollup` / `tool_rollup` / `latency_rollup` are
+  derived state**, rebuilt at ingest after `recompute_canonical` (they read
+  `is_canonical`). Anything that mutates `records` or `tool_uses` outside
+  ingest must rebuild them or the endpoints serve stale numbers; the tests
+  that insert probe rows do exactly that.
+  - Serve from a rollup only what composes: sums, counts, min/max.
+    `PERCENTILE_CONT` does not, which is why response-size p50/p90 stays a
+    live pass and `latency_rollup` stores bands per display-bucket width
+    rather than at one fine grain.
+  - `usage_rollup` and `tool_rollup` are hourly, so they can only answer
+    display buckets >= 1h. The 24h view buckets at 5 minutes and takes a
+    live subquery shaped with the same column names — keep both paths
+    behind one set of queries so they cannot drift.
 - **Don't invoke `~/.kimi-code/scripts/parse_wire.py`** at runtime, and
   don't edit it from this repo. If the canonical Python and our port
   drift, fix it here, not there.
