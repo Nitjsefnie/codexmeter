@@ -19,12 +19,25 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from backend import cache, db, events, parse, r2
 
 log = logging.getLogger("kimimeter.ingest")
+
+# Bounded retry for the R2 GET only (see _fetch_with_retry). The tuple is
+# the backoff BETWEEN attempts, so this is three attempts sleeping 0.5s then
+# 1.0s: long enough to ride out a dropped connection, short enough that a
+# genuinely dead object costs 1.5s rather than a run. Attempts are derived
+# from the tuple so the two can never disagree.
+FETCH_BACKOFF_S = (0.5, 1.0)
+FETCH_ATTEMPTS = len(FETCH_BACKOFF_S) + 1
+
+# How many failing keys the run's `error` summary names before it truncates.
+# The point is a diagnosable message, not a transcript of every key.
+FAILURE_KEYS_IN_SUMMARY = 5
 
 
 def run_ingest(trigger: str) -> dict:
@@ -44,7 +57,12 @@ def run_ingest(trigger: str) -> dict:
     inserted = 0
     reparsed = 0
     deleted = 0
-    err = None
+    # Per-object failures (key, message). Recorded in the run's `error`, but
+    # deliberately NOT used to gate anything: one dropped connection out of
+    # 1,464 files is a run with a retry pending, not a failed run.
+    failed: list[tuple[str, str]] = []
+    # A whole-run exception, which DOES gate the post-passes below.
+    fatal = None
 
     try:
         # Cache existing file_key → (etag, parser_version) for reparse decisions
@@ -142,18 +160,41 @@ def run_ingest(trigger: str) -> dict:
         chunk = max(1, workers * 4)
         for start in range(0, len(todo), chunk):
             batch = todo[start:start + chunk]
+            # (item, parsed, exc) per file. Each fetch+parse is resolved
+            # HERE, paired with its own exception, so one bad object costs
+            # one object: letting f.result() raise out of the collection
+            # step aborted the whole ingest and discarded every already
+            # fetched result in the chunk along with it.
+            outcomes: list[tuple[tuple, dict | None, Exception | None]] = []
             if workers == 1:
-                results = ((item, _fetch_and_parse(item[0].key)) for item in batch)
+                for item in batch:
+                    try:
+                        outcomes.append(
+                            (item, _fetch_and_parse(item[0].key), None)
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        outcomes.append((item, None, e))
             else:
                 with ThreadPoolExecutor(max_workers=workers) as pool:
                     futures = {
                         pool.submit(_fetch_and_parse, item[0].key): item
                         for item in batch
                     }
-                    results = [
-                        (futures[f], f.result()) for f in as_completed(futures)
-                    ]
-            for (obj, proj, project_id, session_id, is_main, stored), parsed in results:
+                    for f in as_completed(futures):
+                        item = futures[f]
+                        try:
+                            outcomes.append((item, f.result(), None))
+                        except Exception as e:  # noqa: BLE001
+                            outcomes.append((item, None, e))
+            for item, parsed, exc in outcomes:
+                obj, proj, project_id, session_id, is_main, stored = item
+                if exc is not None:
+                    failed.append((obj.key, f"{type(exc).__name__}: {exc}"))
+                    log.warning(
+                        "ingest: %s failed after %d attempt(s): %s: %s",
+                        obj.key, FETCH_ATTEMPTS, type(exc).__name__, exc,
+                    )
+                    continue
                 _persist(
                     obj, proj, project_id, session_id, is_main,
                     parsed, parser_version,
@@ -197,7 +238,10 @@ def run_ingest(trigger: str) -> dict:
             c.commit()
 
     except Exception as e:  # noqa: BLE001
-        err = f"{type(e).__name__}: {e}"
+        fatal = f"{type(e).__name__}: {e}"
+
+    # `error` reports BOTH kinds of trouble, but only `fatal` gates anything.
+    err = fatal if fatal is not None else _failure_summary(failed)
 
     finished = datetime.now(timezone.utc)
     with db.viz_conn() as c, c.cursor() as cur:
@@ -217,9 +261,14 @@ def run_ingest(trigger: str) -> dict:
         "inserted": inserted,
         "reparsed": reparsed,
         "deleted": deleted,
+        "failed": len(failed),
         "error": err,
     }
-    if err is None:
+    # Gated on `fatal`, NOT on `err`: the derived state describes whatever
+    # `records` now holds, so skipping the rebuild because one object out of
+    # a thousand could not be fetched is what leaves the rollups and
+    # is_canonical describing the PREVIOUS dataset until the next clean run.
+    if fatal is None:
         # Order matters: the rollup reads is_canonical.
         recompute_canonical()
         rebuild_rollup()
@@ -235,13 +284,29 @@ def run_ingest(trigger: str) -> dict:
     # servable — the refetch returns the previous numbers instantly and the
     # fresh ones land via the background refresh. Threadsafe: ingest runs in
     # a scheduler thread.
-    if err is None and (inserted or reparsed or deleted):
+    if fatal is None and (inserted or reparsed or deleted):
         cache.response_cache.invalidate()
         events.broadcast_threadsafe("ingest_done", summary)
 
-    if err is None:
+    if fatal is None:
         warm_common()
     return summary
+
+
+def _failure_summary(failed: list[tuple[str, str]]) -> str | None:
+    """One line naming how many objects failed and which, or None.
+
+    Goes into ingest_runs.error so a partial run is visible in the admin
+    view, without pretending the whole run failed.
+    """
+    if not failed:
+        return None
+    keys = [key for key, _ in failed]
+    shown = ", ".join(keys[:FAILURE_KEYS_IN_SUMMARY])
+    if len(keys) > FAILURE_KEYS_IN_SUMMARY:
+        shown += f", ... (+{len(keys) - FAILURE_KEYS_IN_SUMMARY} more)"
+    noun = "object" if len(keys) == 1 else "objects"
+    return f"{len(keys)} {noun} failed after retries: {shown}"
 
 
 def rebuild_tool_rollup() -> int:
@@ -505,9 +570,36 @@ def _worker_count() -> int:
         return auto
 
 
+def _fetch_with_retry(key: str) -> bytes:
+    """One R2 GET, retried on failure. Runs on a pool thread.
+
+    The retry lives here rather than in backend.r2 so the sidecar and
+    stream readers keep their current single-shot semantics — only the
+    ingest, which walks the whole bucket in one pass, needs to ride out a
+    transient drop.
+    """
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            return r2.get_object(key)
+        except Exception:  # noqa: BLE001
+            if attempt == FETCH_ATTEMPTS:
+                raise
+            log.warning(
+                "ingest: fetch of %s failed (attempt %d/%d), retrying",
+                key, attempt, FETCH_ATTEMPTS,
+            )
+            time.sleep(FETCH_BACKOFF_S[attempt - 1])
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def _fetch_and_parse(key: str) -> dict:
-    """Runs on a pool thread. Touches no DB connection."""
-    return parse.parse_file(key, r2.get_object(key))
+    """Runs on a pool thread. Touches no DB connection.
+
+    Only the GET is retried: a parse failure is deterministic, so a second
+    attempt reproduces the same error against the same bytes and buys
+    nothing but delay.
+    """
+    return parse.parse_file(key, _fetch_with_retry(key))
 
 
 def _fetch_marker(project_id: str, key: str) -> tuple[str, str] | None:

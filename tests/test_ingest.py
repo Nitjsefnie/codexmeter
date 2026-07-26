@@ -1,6 +1,8 @@
 import os
 import shutil
 import tempfile
+import threading
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,10 @@ import pytest
 from backend import db, ingest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# One of the five wire.jsonl keys in fixtures/r2_mini, used as the object
+# whose fetch is made to fail.
+_FLAKY_KEY = "sessions/projA/sess-A/wire.jsonl"
 
 
 @pytest.fixture
@@ -312,3 +318,193 @@ def test_pool_and_sequential_ingest_agree(fresh_db, mini_r2_env, monkeypatch):
     par_files, par_records = _counts_after_ingest(4)
     assert seq_files == par_files
     assert seq_records == par_records
+
+
+# ------------------------------------------- per-object R2 failures (#3)
+
+def _patch_fetch(monkeypatch, key, fail_times):
+    """Make r2.get_object fail for `key` on its first `fail_times` calls.
+
+    Returns (call_counts, slept) — the per-key GET count (the pooled path
+    calls this from several threads, hence the lock) and the backoff sleeps
+    the retry asked for, which are swallowed so the suite does not pay them.
+    """
+    real_get = ingest.r2.get_object
+    counts: Counter = Counter()
+    slept: list[float] = []
+    lock = threading.Lock()
+
+    def flaky(k):
+        with lock:
+            counts[k] += 1
+            n = counts[k]
+        if k == key and n <= fail_times:
+            raise OSError(f"connection reset while fetching {k}")
+        return real_get(k)
+
+    monkeypatch.setattr(ingest.r2, "get_object", flaky)
+    monkeypatch.setattr(ingest.time, "sleep", lambda s: slept.append(s))
+    return counts, slept
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_one_failed_object_does_not_abort_the_run(
+    fresh_db, mini_r2_env, monkeypatch, workers
+):
+    """A single unfetchable object costs that object, not the ingest.
+
+    Both the sequential and the pooled path are exercised: they collect
+    results differently (a generator consumed in the persist loop vs
+    as_completed), and each used to let the exception escape.
+    """
+    monkeypatch.setenv("INGEST_WORKERS", str(workers))
+    counts, _ = _patch_fetch(monkeypatch, _FLAKY_KEY, fail_times=99)
+
+    result = ingest.run_ingest(trigger="manual")
+
+    assert result["failed"] == 1
+    assert result["inserted"] == 4, "the other four files must still persist"
+    assert result["error"] == (
+        f"1 object failed after retries: {_FLAKY_KEY}"
+    )
+    assert counts[_FLAKY_KEY] == ingest.FETCH_ATTEMPTS
+    with db.viz_conn() as c:
+        keys = [r[0] for r in c.execute(
+            "SELECT file_key FROM files ORDER BY file_key"
+        ).fetchall()]
+    assert _FLAKY_KEY not in keys
+    assert len(keys) == 4
+
+
+def test_per_object_failure_still_rebuilds_derived_state(
+    fresh_db, mini_r2_env, monkeypatch
+):
+    """The regression that matters: derived state must not be left stale.
+
+    recompute_canonical() and the rollups describe whatever `records` now
+    holds. Gating them on a flawless run meant one dropped connection left
+    `usage_rollup` / `tool_rollup` describing the PREVIOUS dataset and
+    is_canonical un-recomputed until some later run happened to be clean.
+    """
+    ingest.run_ingest(trigger="manual")
+    with db.viz_conn() as c:
+        rollup_before = c.execute(
+            "SELECT COUNT(*) FROM usage_rollup"
+        ).fetchone()[0]
+        dupes_before = c.execute(
+            "SELECT COUNT(*) FROM records WHERE NOT is_canonical"
+        ).fetchone()[0]
+    assert rollup_before > 0 and dupes_before > 0, "fixture proves nothing"
+
+    with db.viz_conn() as c:
+        # Tool calls hang off the file whose fetch fails, so the reparse
+        # never deletes them and tool_rollup has something to rebuild from.
+        c.execute(
+            "INSERT INTO tool_uses (file_key, line_num, idx, ts, tool_name, "
+            "is_error) VALUES (%s, 9001, 0, now(), 'Read', false)",
+            (_FLAKY_KEY,),
+        )
+        # Wreck every piece of derived state, then prove the run restores it.
+        c.execute("TRUNCATE usage_rollup")
+        c.execute("TRUNCATE tool_rollup")
+        c.execute("UPDATE records SET is_canonical = TRUE")
+        c.commit()
+
+    monkeypatch.setenv("PARSER_VERSION", "2")
+    _patch_fetch(monkeypatch, _FLAKY_KEY, fail_times=99)
+    result = ingest.run_ingest(trigger="manual")
+    assert result["failed"] == 1
+    assert result["reparsed"] == 4
+
+    with db.viz_conn() as c:
+        rollup_after = c.execute(
+            "SELECT COUNT(*) FROM usage_rollup"
+        ).fetchone()[0]
+        dupes_after = c.execute(
+            "SELECT COUNT(*) FROM records WHERE NOT is_canonical"
+        ).fetchone()[0]
+        tool_rollup_after = c.execute(
+            "SELECT COUNT(*) FROM tool_rollup"
+        ).fetchone()[0]
+    assert rollup_after == rollup_before, "usage_rollup was not rebuilt"
+    assert dupes_after == dupes_before, "is_canonical was not recomputed"
+    assert tool_rollup_after > 0, "tool_rollup was not rebuilt"
+
+
+def test_a_transient_fetch_failure_is_retried_and_recovers(
+    fresh_db, mini_r2_env, monkeypatch
+):
+    """Two failed GETs then a good one: the file lands, the run is clean."""
+    counts, slept = _patch_fetch(monkeypatch, _FLAKY_KEY, fail_times=2)
+
+    result = ingest.run_ingest(trigger="manual")
+
+    assert result["failed"] == 0
+    assert result["error"] is None
+    assert result["inserted"] == 5
+    assert counts[_FLAKY_KEY] == 3
+    assert slept == [0.5, 1.0], "exponential backoff between attempts"
+    with db.viz_conn() as c:
+        n = c.execute(
+            "SELECT COUNT(*) FROM files WHERE file_key = %s", (_FLAKY_KEY,)
+        ).fetchone()[0]
+    assert n == 1
+
+
+def test_fetch_gives_up_after_three_attempts(
+    fresh_db, mini_r2_env, monkeypatch
+):
+    """The retry is bounded — it must not spin on a genuinely dead object."""
+    counts, slept = _patch_fetch(monkeypatch, _FLAKY_KEY, fail_times=99)
+
+    result = ingest.run_ingest(trigger="manual")
+
+    assert counts[_FLAKY_KEY] == 3
+    assert slept == [0.5, 1.0]
+    assert result["failed"] == 1
+    assert "connection reset" not in (result["error"] or ""), \
+        "the summary names keys, not stack noise"
+    assert _FLAKY_KEY in result["error"]
+
+
+def test_a_parse_failure_is_not_retried(fresh_db, mini_r2_env, monkeypatch):
+    """Parsing is deterministic: re-fetching the same bytes buys nothing."""
+    real_get = ingest.r2.get_object
+    counts: Counter = Counter()
+    lock = threading.Lock()
+
+    def counting(k):
+        with lock:
+            counts[k] += 1
+        return real_get(k)
+
+    real_parse = ingest.parse.parse_file
+
+    def boom(file_key, blob):
+        if file_key == _FLAKY_KEY:
+            raise ValueError("malformed line 3")
+        return real_parse(file_key, blob)
+
+    monkeypatch.setattr(ingest.r2, "get_object", counting)
+    monkeypatch.setattr(ingest.parse, "parse_file", boom)
+    monkeypatch.setattr(ingest.time, "sleep", lambda s: pytest.fail(
+        "a parse failure must not sleep on a retry"
+    ))
+
+    result = ingest.run_ingest(trigger="manual")
+
+    assert counts[_FLAKY_KEY] == 1, "the GET must not be repeated"
+    assert result["failed"] == 1
+    assert result["inserted"] == 4
+    assert "ValueError" not in (result["error"] or "")
+
+
+def test_failure_summary_truncates_a_long_key_list():
+    """A 1,464-file run losing its connection must not write a novel into
+    ingest_runs.error."""
+    failed = [(f"sessions/p/s{i}/wire.jsonl", "OSError: boom") for i in range(9)]
+    summary = ingest._failure_summary(failed)
+    assert summary.startswith("9 objects failed after retries: ")
+    assert summary.endswith(", ... (+4 more)")
+    assert summary.count("wire.jsonl") == ingest.FAILURE_KEYS_IN_SUMMARY
+    assert ingest._failure_summary([]) is None
