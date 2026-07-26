@@ -23,9 +23,28 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
+from botocore.exceptions import BotoCoreError, ClientError
+
 from backend import cache, db, events, parse, r2
 
 log = logging.getLogger("kimimeter.ingest")
+
+# What the fetch retry treats as transient. None of the boto3 failures is an
+# OSError — ConnectionClosedError and EndpointConnectionError are
+# BotoCoreErrors, and ClientError descends from neither — so catching
+# OSError alone would miss exactly the drops this retry exists for.
+# Deliberately NOT `Exception`: see FatalFetchError.
+TRANSIENT_FETCH_ERRORS = (OSError, BotoCoreError, ClientError)
+
+
+class FatalFetchError(Exception):
+    """A non-transient failure of an R2 GET, i.e. a bug rather than a drop.
+
+    Routed past the per-object collector to the run-level handler on
+    purpose: it is not something the next hourly run will fix, and booking
+    it per object would report a code defect as a partial-data problem.
+    """
+
 
 # Bounded retry for the R2 GET only (see _fetch_with_retry). The tuple is
 # the backoff BETWEEN attempts, so this is three attempts sleeping 0.5s then
@@ -272,6 +291,10 @@ def _resolve(items: list, call, workers: int) -> list[tuple]:
     already-fetched result alongside it. The two shapes have to behave
     identically, which is easiest to guarantee with one implementation.
 
+    FatalFetchError is the one exception that still escapes: it means the
+    fetch is broken rather than one object being unlucky, so it belongs to
+    the run, not to the item.
+
     Returns [(item, result, None) | (item, None, exception)].
     """
     outcomes: list[tuple] = []
@@ -279,6 +302,8 @@ def _resolve(items: list, call, workers: int) -> list[tuple]:
         for item in items:
             try:
                 outcomes.append((item, call(item), None))
+            except FatalFetchError:
+                raise
             except Exception as e:  # noqa: BLE001
                 outcomes.append((item, None, e))
     else:
@@ -288,6 +313,8 @@ def _resolve(items: list, call, workers: int) -> list[tuple]:
                 item = futures[f]
                 try:
                     outcomes.append((item, f.result(), None))
+                except FatalFetchError:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     outcomes.append((item, None, e))
     return outcomes
@@ -581,17 +608,23 @@ def _worker_count() -> int:
 
 
 def _fetch_with_retry(key: str) -> bytes:
-    """One R2 GET, retried on failure. Runs on a pool thread.
+    """One R2 GET, retried on transient failure. Runs on a pool thread.
 
     The retry lives here rather than in backend.r2 so the sidecar and
     stream readers keep their current single-shot semantics — only the
     ingest, which walks the whole bucket in one pass, needs to ride out a
     transient drop.
+
+    Anything outside TRANSIENT_FETCH_ERRORS is a bug, not a dropped
+    connection, and is re-raised as FatalFetchError so the per-object
+    collector does not absorb it: a TypeError inside get_object would
+    otherwise become a 1,464-object "partial run" that slept 37 minutes
+    through the same bug instead of raising one loud traceback.
     """
     for attempt in range(1, FETCH_ATTEMPTS + 1):
         try:
             return r2.get_object(key)
-        except Exception:  # noqa: BLE001
+        except TRANSIENT_FETCH_ERRORS:
             if attempt == FETCH_ATTEMPTS:
                 raise
             log.warning(
@@ -599,6 +632,8 @@ def _fetch_with_retry(key: str) -> bytes:
                 key, attempt, FETCH_ATTEMPTS,
             )
             time.sleep(FETCH_BACKOFF_S[attempt - 1])
+        except Exception as e:  # noqa: BLE001
+            raise FatalFetchError(f"{key}: {type(e).__name__}: {e}") from e
     raise AssertionError("unreachable")  # pragma: no cover
 
 

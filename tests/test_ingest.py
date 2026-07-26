@@ -469,6 +469,32 @@ def test_fetch_gives_up_after_three_attempts(
     assert _FLAKY_KEY in result["error"]
 
 
+def test_a_programming_error_in_the_fetch_is_not_retried(
+    fresh_db, mini_r2_env, monkeypatch
+):
+    """A bug is not a transient, and must not be dressed up as one.
+
+    Retrying a TypeError sleeps 1.5s per object and books it as a
+    per-object failure — at 1,464 objects that is a silent 37-minute
+    "partial run" instead of one loud traceback.
+    """
+    counts, slept = _patch_fetch(
+        monkeypatch, _FLAKY_KEY, fail_times=99,
+        exc=TypeError("get_object() takes 1 positional argument but 2 were given"),
+    )
+
+    result = ingest.run_ingest(trigger="manual")
+
+    assert counts[_FLAKY_KEY] == 1, "a bug must not be retried"
+    assert slept == [], "and must not sleep"
+    assert result["failed"] == 0, "it is not a per-object failure"
+    assert result["error"].startswith("FatalFetchError:"), result["error"]
+    assert "TypeError" in result["error"], "the type must survive into the run"
+    with db.viz_conn() as c:
+        rollup = c.execute("SELECT COUNT(*) FROM usage_rollup").fetchone()[0]
+    assert rollup == 0, "a fatal run must not rebuild derived state"
+
+
 def test_a_parse_failure_is_not_retried(fresh_db, mini_r2_env, monkeypatch):
     """Parsing is deterministic: re-fetching the same bytes buys nothing."""
     real_get = ingest.r2.get_object
