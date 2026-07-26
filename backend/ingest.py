@@ -21,7 +21,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from backend import db, events, parse, r2
+from backend import cache, db, events, parse, r2
 
 
 def run_ingest(trigger: str) -> dict:
@@ -216,7 +216,17 @@ def run_ingest(trigger: str) -> dict:
         "deleted": deleted,
         "error": err,
     }
+    # Data changed: mark the response cache stale, then notify connected
+    # SSE clients so the dashboard re-fetches without a page reload.
+    #
+    # invalidate() rather than clear(): clearing would drop every user onto
+    # the uncached path on every ingest, so the refetch that ingest_done
+    # triggers would block on a cold query. Marking stale keeps the entries
+    # servable — the refetch returns the previous numbers instantly and the
+    # fresh ones land via the background refresh. Threadsafe: ingest runs in
+    # a scheduler thread.
     if err is None and (inserted or reparsed or deleted):
+        cache.response_cache.invalidate()
         events.broadcast_threadsafe("ingest_done", summary)
 
     return summary

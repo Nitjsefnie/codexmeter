@@ -155,6 +155,28 @@ def test_no_changes_second_run_is_zero_reparse(fresh_db, mini_r2_env):
     assert result2["reparsed"] == 0
 
 
+def test_ingest_marks_response_cache_stale(fresh_db, mini_r2_env):
+    """Ingest marks cached responses stale but leaves them SERVABLE.
+
+    Clearing outright would drop every reader onto the uncached path on
+    each ingest. Stale-while-revalidate keeps the previous numbers
+    available while the refresh runs off the request path.
+    """
+    from backend import cache
+
+    cache.response_cache.put("stale-key", {"v": "old"})
+    entry = cache.response_cache.get_entry("stale-key")
+    assert entry == ({"v": "old"}, False), "fresh before ingest"
+
+    ingest.run_ingest(trigger="manual")
+
+    entry = cache.response_cache.get_entry("stale-key")
+    assert entry is not None, "ingest must NOT drop the entry"
+    value, is_stale = entry
+    assert value == {"v": "old"}, "previous response still servable"
+    assert is_stale is True, "and flagged for background refresh"
+
+
 def test_first_seen_at_uses_least(fresh_db, mini_r2_env):
     """projects.first_seen_at must NOT be locked at first-ingest mtime.
     Add a NEW file under an existing project with an earlier mtime;

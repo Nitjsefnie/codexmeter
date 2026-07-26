@@ -67,6 +67,19 @@ def app_with_data(monkeypatch):
 
 
 @pytest.fixture
+def app_with_fresh_data(monkeypatch):
+    """Same data as `app_with_data`, on a database of its own.
+
+    Tests that MUTATE the DB underneath the app belong here — sharing the
+    read-only fixture's database would leak the mutation into every test
+    that runs after them.
+    """
+    client, tmp, test_db = _build_app(monkeypatch, test_db="kimi_viz_test_api_mut")
+    yield client
+    _cleanup_app(tmp, test_db)
+
+
+@pytest.fixture
 def app_with_unresolved(monkeypatch):
     """Plain fixture plus two junk hash-projects (no project.json marker).
 
@@ -376,3 +389,20 @@ def test_activity_heatmap_project_filter(app_with_data):
 
 def test_activity_heatmap_bad_range_400(app_with_data):
     assert app_with_data.get("/api/activity-heatmap?range=bogus").status_code == 400
+
+
+def test_dashboard_response_is_cached_and_fresh_bypasses(app_with_fresh_data):
+    from backend import cache, db
+
+    cache.response_cache.clear()
+    first = app_with_fresh_data.get("/api/dashboard?range=all").json()
+
+    # Mutate the DB underneath the cache: delete every record.
+    with db.viz_conn() as c:
+        c.execute("DELETE FROM records")
+
+    cached = app_with_fresh_data.get("/api/dashboard?range=all").json()
+    assert cached == first                       # stale-but-cached payload
+
+    fresh = app_with_fresh_data.get("/api/dashboard?range=all&fresh=1").json()
+    assert fresh["cost_by_model"] == []          # fresh=1 sees the empty DB

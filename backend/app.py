@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import ORJSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, Response
@@ -58,6 +59,11 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
+    # /api/dashboard at range=all returns a multi-megabyte body. Starlette's
+    # JSONResponse runs jsonable_encoder over that whole structure and then
+    # stdlib json.dumps; orjson serialises the same payload in a fraction of
+    # the time and skips the encoder pass entirely.
+    default_response_class=ORJSONResponse,
 )
 app.middleware("http")(session.auth_middleware)
 app.include_router(login.router)

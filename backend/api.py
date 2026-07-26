@@ -15,6 +15,10 @@ tables but returning OLD response shape:
 """
 from __future__ import annotations
 
+import logging
+import os
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -23,9 +27,71 @@ from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
 from backend import cache, db, pricing, r2
+from backend.cache import cache_response
 
 
 router = APIRouter(prefix="/api")
+
+log = logging.getLogger("kimimeter.api")
+
+# Per-phase wall-clock for the heavy read endpoints, emitted as one log
+# line per request. Gated on KIMIMETER_TIMING so it costs nothing normally,
+# but stays in the tree — reconstructing these queries by hand in psql
+# drifts from what the endpoint actually runs and hides everything that
+# happens outside SQL (row marshalling, response serialisation).
+TIMING_ON = os.environ.get("KIMIMETER_TIMING", "").lower() not in ("", "0", "false", "no")
+
+if TIMING_ON and not log.handlers:
+    # uvicorn configures its own loggers and leaves the root logger at
+    # WARNING, so a bare log.info() here would go nowhere. Attach our own
+    # handler rather than depending on someone else's logging config.
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s:     %(message)s"))
+    log.addHandler(_handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+
+class Phases:
+    """Collect labelled phase timings and log them as a single line."""
+
+    __slots__ = ("_name", "_marks", "_t0")
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._marks: list[tuple[str, float]] = []
+        self._t0 = time.perf_counter()
+
+    @contextmanager
+    def step(self, label: str):
+        t = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._marks.append((label, time.perf_counter() - t))
+
+    def mark(self, label: str, seconds: float) -> None:
+        self._marks.append((label, seconds))
+
+    def execute(self, label: str, cur, sql: str, args: Any = None):
+        """Time a single ``cursor.execute`` and record it under `label`.
+
+        Returns the cursor, so call sites keep their trailing
+        ``.fetchall()`` / ``.fetchone()`` unchanged.
+        """
+        t = time.perf_counter()
+        try:
+            return cur.execute(sql, args) if args is not None else cur.execute(sql)
+        finally:
+            self._marks.append((label, time.perf_counter() - t))
+
+    def done(self, **extra: Any) -> None:
+        if not TIMING_ON:
+            return
+        total = (time.perf_counter() - self._t0) * 1000
+        parts = " ".join(f"{k}={v * 1000:.0f}ms" for k, v in self._marks)
+        tail = " ".join(f"{k}={v}" for k, v in extra.items())
+        log.info("TIMING %s total=%.0fms %s %s", self._name, total, parts, tail)
 
 
 # Kimi-only ingest right now — parse.py emits one of these for every record.
@@ -65,7 +131,7 @@ def _proj_filter(project: str | None, args: list) -> str:
 
 
 @router.get("/me")
-async def me(request: Request) -> dict:
+def me(request: Request) -> dict:
     """Identity probe — frontend uses `is_guest` to decide which UI
     affordances to render."""
     return {
@@ -75,7 +141,8 @@ async def me(request: Request) -> dict:
 
 
 @router.get("/tool-usage")
-async def tool_usage(
+@cache_response
+def tool_usage(
     range: str = Query("30d"),
     project: str | None = Query(None),
     model: str | None = Query(None),
@@ -132,7 +199,8 @@ async def tool_usage(
 
 
 @router.get("/tool-error-rate")
-async def tool_error_rate(
+@cache_response
+def tool_error_rate(
     range: str = Query("30d"),
     project: str | None = Query(None),
     model: str | None = Query(None),
@@ -192,7 +260,8 @@ async def tool_error_rate(
 
 
 @router.get("/activity-heatmap")
-async def activity_heatmap(
+@cache_response
+def activity_heatmap(
     range: str = Query("30d"),
     project: str | None = Query(None),
     model: str | None = Query(None),
@@ -261,7 +330,8 @@ async def activity_heatmap(
 
 
 @router.get("/reply-latency")
-async def reply_latency(
+@cache_response
+def reply_latency(
     range: str = Query("30d"),
     project: str | None = Query(None),
     model: str | None = Query(None),
@@ -434,7 +504,7 @@ async def event_stream(request: Request):
 
 
 @router.get("/models")
-async def list_models() -> dict:
+def list_models() -> dict:
     """All distinct (real, non-synthetic) model strings ever recorded,
     with counts. Frontend canonicalizes via shortModelName for the
     dropdown."""
@@ -452,7 +522,8 @@ async def list_models() -> dict:
 
 
 @router.get("/projects")
-async def list_projects() -> dict:
+@cache_response
+def list_projects() -> dict:
     """Per-project rollup: file_count, total_cost, derived from files+records."""
     with db.viz_conn() as c:
         cond = _unresolved_cond("p.")
@@ -522,7 +593,8 @@ def _parse_range(s: str) -> timedelta:
 
 
 @router.get("/cache")
-async def cache_view(
+@cache_response
+def cache_view(
     range: str = Query("30d"),
     project: str | None = Query(None),
     model: str | None = Query(None),
@@ -571,8 +643,11 @@ async def cache_view(
     )
     """
 
+    ph = Phases("cache_view")
+
     with db.viz_conn() as c:
-        per_model_rows = c.execute(
+        per_model_rows = ph.execute(
+            "per_model", c,
             base_cte + """
             SELECT model,
                    COUNT(*)                    AS turns,
@@ -587,7 +662,8 @@ async def cache_view(
             args2,
         ).fetchall()
 
-        top_output = c.execute(
+        top_output = ph.execute(
+            "top_output", c,
             base_cte + """
             SELECT ts, line_num, model,
                    output_tokens, cache_read_tokens,
@@ -599,7 +675,8 @@ async def cache_view(
             args2,
         ).fetchall()
 
-        top_read = c.execute(
+        top_read = ph.execute(
+            "top_read", c,
             base_cte + """
             SELECT ts, line_num, model,
                    cache_read_tokens,
@@ -637,6 +714,8 @@ async def cache_view(
                 "output": round(o_cost, 4),
             },
         }
+
+    ph.done(range=range, project=project, model=model)
 
     per_model = [_per_model(r) for r in per_model_rows]
 
@@ -690,7 +769,8 @@ async def cache_view(
 
 
 @router.get("/context-growth/agg")
-async def context_growth_agg(
+@cache_response
+def context_growth_agg(
     range: str = Query("30d"),
     project: str | None = Query(None),
 ) -> dict:
@@ -764,7 +844,7 @@ async def context_growth_agg(
 
 
 @router.get("/context-growth/session/{session_id}")
-async def context_growth_session(session_id: str) -> dict:
+def context_growth_session(session_id: str) -> dict:
     """Per-turn array for the MAIN file of this session, mirroring
     parse_session.py:compute_context_growth output exactly."""
     with db.viz_conn() as c:
@@ -792,7 +872,7 @@ async def context_growth_session(session_id: str) -> dict:
 
 
 @router.get("/sessions/{session_id}/transcript")
-async def get_transcript(session_id: str) -> Response:
+def get_transcript(session_id: str) -> Response:
     """Stream raw jsonl from R2 via 20-min idle LRU. The MAIN file of the
     session is what's returned (the agent peers are visible only via the
     Inspector's per-file dropdown, future work)."""
@@ -817,7 +897,7 @@ async def get_transcript(session_id: str) -> Response:
 
 
 @router.get("/sessions/{session_id}/sidecar")
-async def get_sidecar(
+def get_sidecar(
     session_id: str,
     path: str = Query(..., min_length=1),
 ) -> Response:
@@ -871,7 +951,8 @@ def _iso(v) -> str | None:
 
 
 @router.get("/dashboard")
-async def dashboard(
+@cache_response
+def dashboard(
     range: str = Query("30d"),
     project: str | None = Query(None),
     model: str | None = Query(None),
@@ -918,8 +999,11 @@ async def dashboard(
     )
     """
 
+    ph = Phases("dashboard")
+
     with db.viz_conn() as c:
-        hourly_rows = c.execute(
+        hourly_rows = ph.execute(
+            "hourly", c,
             base_cte + f"""
             SELECT to_timestamp(
                      floor(EXTRACT(EPOCH FROM d.ts) / {bucket_s}) * {bucket_s} + {bucket_s} / 2
@@ -940,7 +1024,8 @@ async def dashboard(
             args2,
         ).fetchall()
 
-        cost_by_model_rows = c.execute(
+        cost_by_model_rows = ph.execute(
+            "cost_by_model", c,
             base_cte + """
             SELECT COALESCE(NULLIF(d.model, ''), 'unknown') AS model,
                    SUM(d.cost_usd) AS cost_usd
@@ -951,7 +1036,8 @@ async def dashboard(
             args2,
         ).fetchall()
 
-        total_sessions_row = c.execute(
+        total_sessions_row = ph.execute(
+            "total_sessions", c,
             base_cte + """
             SELECT COUNT(DISTINCT f.session_id) AS n
             FROM deduped d
@@ -963,7 +1049,8 @@ async def dashboard(
         total_sessions = int(total_sessions_row[0] or 0) if total_sessions_row else 0
 
         file_counts_args = list(args)
-        file_counts_row = c.execute(
+        file_counts_row = ph.execute(
+            "file_counts", c,
             f"""
             SELECT
               COUNT(*) FILTER (WHERE is_main AND EXISTS (
@@ -992,7 +1079,8 @@ async def dashboard(
         subagent_files         = int(file_counts_row[2] or 0) if file_counts_row else 0
         subagent_only_sessions = int(file_counts_row[3] or 0) if file_counts_row else 0
 
-        sessions_rows = c.execute(
+        sessions_rows = ph.execute(
+            "sessions", c,
             base_cte + """
             SELECT f.session_id,
                    EXTRACT(EPOCH FROM MIN(d.ts))::float AS start_ts,
@@ -1043,7 +1131,8 @@ async def dashboard(
         # responses" with "more thinking". Character count of text
         # content blocks is the clean, model-fair "visible response
         # size" measure.
-        response_sizes_rows = c.execute(
+        response_sizes_rows = ph.execute(
+            "response_sizes", c,
             base_cte + f"""
             SELECT to_timestamp(
                      floor(EXTRACT(EPOCH FROM d.ts) / {bucket_s}) * {bucket_s} + {bucket_s} / 2
@@ -1064,7 +1153,8 @@ async def dashboard(
         # ctx_turns for the parent-session (main) files only — used to
         # join into per-folder `sessions_out` rows for the burn-rate
         # tooltip's ctx_at_end and the burn dot scaling.
-        ctx_turns_rows = c.execute(
+        ctx_turns_rows = ph.execute(
+            "ctx_turns", c,
             f"""
             SELECT f.session_id, f.ctx_turns
             FROM files f
@@ -1081,7 +1171,8 @@ async def dashboard(
         # invocation surfaces under whatever model it ran on, even if
         # there's no main session file on disk.
         ctx_traces_args = list(args)
-        ctx_traces_rows = c.execute(
+        ctx_traces_rows = ph.execute(
+            "ctx_traces", c,
             f"""
             WITH file_models AS (
               SELECT r.file_key,
@@ -1106,7 +1197,8 @@ async def dashboard(
         ).fetchall()
 
         burn_args = list(args)
-        burn_rows = c.execute(
+        burn_rows = ph.execute(
+            "burn", c,
             f"""
             WITH per_session AS (
               SELECT f.session_id, f.file_key,
@@ -1136,7 +1228,8 @@ async def dashboard(
         ).fetchall()
 
         ctx_args = list(args)
-        ctx_rows = c.execute(
+        ctx_rows = ph.execute(
+            "ctx_lines", c,
             f"""
             SELECT f.session_id, f.ctx_turns
             FROM files f
@@ -1153,7 +1246,8 @@ async def dashboard(
         ).fetchall()
 
         rl_args = list(args)
-        rl_rows = c.execute(
+        rl_rows = ph.execute(
+            "rate_limits", c,
             f"""
             SELECT f.session_id, hit
             FROM files f, jsonb_array_elements(f.rate_limit_hits) AS hit
@@ -1261,6 +1355,8 @@ async def dashboard(
             "content": (hit or {}).get("content", ""),
         })
 
+    ph.done(range=range, project=project, model=model)
+
     return {
         "range": range,
         "project": project,
@@ -1334,7 +1430,7 @@ def _aggregate_session_row(row) -> dict:
 
 
 @router.get("/sessions")
-async def list_sessions(
+def list_sessions(
     project: str | None = Query(None),
     limit: int = Query(50, ge=1, le=500),
     cursor: str | None = Query(None),
@@ -1424,7 +1520,7 @@ async def list_sessions(
 
 
 @router.get("/sessions/{session_id}")
-async def session_detail(session_id: str) -> dict:
+def session_detail(session_id: str) -> dict:
     """Single-session aggregation including ctx_trace and burn rate.
 
     `ctx_trace` is the canonical files.ctx_turns array reshaped to
