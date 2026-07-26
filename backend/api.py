@@ -1010,24 +1010,21 @@ def dashboard(
                    SUM(d.cache_read_tokens) AS cache_read_tokens,
                    SUM(d.cost_usd)         AS cost_usd,
                    COUNT(*)                AS requests,
-                   COUNT(DISTINCT f.session_id) AS session_count
+                   COUNT(DISTINCT f.session_id) AS session_count,
+                   -- Response sizes used to be a SECOND full pass grouped
+                   -- by the same (bucket, model) over the same rows. The
+                   -- percentiles just need the text-bearing subset, which
+                   -- FILTER gives us without a separate scan.
+                   COUNT(*) FILTER (WHERE d.text_chars > 0) AS text_n,
+                   PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY d.text_chars)
+                     FILTER (WHERE d.text_chars > 0) AS text_p50,
+                   PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY d.text_chars)
+                     FILTER (WHERE d.text_chars > 0) AS text_p90
             FROM deduped d
             JOIN files f ON f.file_key = d.file_key
             WHERE d.ts IS NOT NULL
             GROUP BY 1, 2
             ORDER BY 1, 2
-            """,
-            args,
-        ).fetchall()
-
-        cost_by_model_rows = ph.execute(
-            "cost_by_model", c,
-            base_cte + """
-            SELECT COALESCE(NULLIF(d.model, ''), 'unknown') AS model,
-                   SUM(d.cost_usd) AS cost_usd
-            FROM deduped d
-            GROUP BY 1
-            ORDER BY 2 DESC
             """,
             args,
         ).fetchall()
@@ -1127,24 +1124,6 @@ def dashboard(
         # responses" with "more thinking". Character count of text
         # content blocks is the clean, model-fair "visible response
         # size" measure.
-        response_sizes_rows = ph.execute(
-            "response_sizes", c,
-            base_cte + f"""
-            SELECT to_timestamp(
-                     floor(EXTRACT(EPOCH FROM d.ts) / {bucket_s}) * {bucket_s} + {bucket_s} / 2
-                   ) AS bucket,
-                   COALESCE(NULLIF(d.model, ''), 'unknown') AS model,
-                   COUNT(*) AS n,
-                   PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY d.text_chars) AS p50,
-                   PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY d.text_chars) AS p90
-            FROM deduped d
-            WHERE d.text_chars > 0 AND d.ts IS NOT NULL
-            GROUP BY 1, 2
-            ORDER BY 1, 2
-            """,
-            args,
-        ).fetchall()
-
         ctx_turns_args = list(args)
         # ctx_turns for the parent-session (main) files only — used to
         # join into per-folder `sessions_out` rows for the burn-rate
@@ -1255,14 +1234,20 @@ def dashboard(
 
     hourly = []
     seen_hours: set[str | None] = set()
+    # cost_by_model and response_sizes are folded out of these same rows
+    # rather than costing their own full pass over the records.
+    cost_by_model_acc: dict[str, float] = {}
+    response_sizes = []
     for row in hourly_rows:
-        (hour, model, input_t, output_t, cr, cost, reqs, sc) = row
+        (hour, model, input_t, output_t, cr, cost, reqs, sc,
+         text_n, text_p50, text_p90) = row
         hour_iso = _iso(hour)
         is_first_for_hour = hour_iso not in seen_hours
         seen_hours.add(hour_iso)
+        model_name = model or "unknown"
         hourly.append({
             "hour": hour_iso,
-            "model": model or "unknown",
+            "model": model_name,
             "input_tokens": int(input_t or 0),
             "output_tokens": int(output_t or 0),
             "cache_read_tokens": int(cr or 0),
@@ -1270,6 +1255,17 @@ def dashboard(
             "requests": int(reqs or 0),
             "session_count": int(sc or 0) if is_first_for_hour else 0,
         })
+        cost_by_model_acc[model_name] = (
+            cost_by_model_acc.get(model_name, 0.0) + float(cost or 0)
+        )
+        if text_n:
+            response_sizes.append({
+                "ts": hour_iso,
+                "model": model_name,
+                "n": int(text_n or 0),
+                "p50": float(text_p50 or 0),
+                "p90": float(text_p90 or 0),
+            })
 
     burns = []
     for sid, tps, model in burn_rows:
@@ -1304,11 +1300,11 @@ def dashboard(
         if trace:
             ctx_lines.append({"session_id": sid, "trace": trace})
 
-    cost_by_model = [
-        {"model": m, "cost_usd": float(c or 0)}
-        for (m, c) in cost_by_model_rows
-        if (c or 0) > 0
-    ]
+    cost_by_model = sorted(
+        ({"model": m, "cost_usd": v} for m, v in cost_by_model_acc.items() if v > 0),
+        key=lambda r: r["cost_usd"],
+        reverse=True,
+    )
 
     ctx_turns_by_session = {sid: turns for (sid, turns) in ctx_turns_rows}
     sessions_out = []
@@ -1381,16 +1377,7 @@ def dashboard(
             }
             for (fk, sid, is_main, model, turns) in ctx_traces_rows
         ],
-        "response_sizes": [
-            {
-                "ts": _iso(bucket),
-                "model": m,
-                "n": int(n or 0),
-                "p50": float(p50 or 0),
-                "p90": float(p90 or 0),
-            }
-            for (bucket, m, n, p50, p90) in response_sizes_rows
-        ],
+        "response_sizes": response_sizes,
         "ctx_lines": ctx_lines,
     }
 
