@@ -596,3 +596,36 @@ def test_rate_limit_hits_are_filtered_on_the_hits_own_ts(app_with_fresh_data):
     wide = app_with_fresh_data.get("/api/dashboard?range=3650d").json()
     assert [h["content"] for h in wide["rate_limit_hits"] if h["content"] == "old hit"] \
         == ["old hit"], "and the file's mtime clause must still let it through"
+
+
+def test_a_malformed_hit_ts_does_not_take_down_the_dashboard(app_with_fresh_data):
+    """Junk in a hit's `ts` must be excluded, not raised.
+
+    Casting it is what filters on the hit's own time, but an unguarded
+    `::timestamptz` RAISES on a malformed value, and the traceback escapes
+    the handler — so one bad `ts` anywhere in files.rate_limit_hits would
+    500 the entire dashboard, every panel, not merely this one.
+    """
+    import psycopg
+    from backend import cache
+
+    with psycopg.connect(os.environ["DATABASE_URL_VIZ"]) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE files SET r2_last_modified = now(), "
+            "       rate_limit_hits = %s::jsonb "
+            " WHERE file_key = (SELECT MIN(file_key) FROM files WHERE is_main)",
+            (json.dumps([
+                {"ts": "not-a-timestamp", "content": "junk ts"},
+                {"ts": 123, "content": "numeric ts"},
+                {"ts": "", "content": "empty ts"},
+                {"ts": None, "content": "null ts"},
+                {"content": "no ts key at all"},
+                {"ts": "2026-07-20T10:00:00Z", "content": "good hit"},
+            ]),),
+        )
+        conn.commit()
+
+    cache.response_cache.clear()
+    r = app_with_fresh_data.get("/api/dashboard?range=3650d")
+    assert r.status_code == 200, f"{r.status_code}: {r.text[:300]}"
+    assert [h["content"] for h in r.json()["rate_limit_hits"]] == ["good hit"]

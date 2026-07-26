@@ -1361,7 +1361,7 @@ def dashboard(
         rl_args = list(file_args) + [since]
         rl_rows = ph.execute(
             "rate_limits", c,
-            f"""
+            rf"""
             SELECT f.session_id, hit
             FROM files f, jsonb_array_elements(f.rate_limit_hits) AS hit
             WHERE f.r2_last_modified >= %s {proj_filter}
@@ -1370,7 +1370,18 @@ def dashboard(
               -- a file touched within range can still carry hits older
               -- than `since`, so filter on each hit's own ts too. The
               -- mtime clause stays as the coarse, indexable pre-filter.
-              AND NULLIF(hit->>'ts', '')::timestamptz >= %s
+              --
+              -- The cast is guarded by a CASE, not by a plain
+              -- `AND regex AND cast`: casting a malformed ts RAISES
+              -- (`invalid input syntax for type timestamp with time zone`)
+              -- and would take out the WHOLE dashboard, not just this
+              -- panel, and the planner is free to evaluate a bare cast
+              -- before the regex that was meant to protect it. CASE is the
+              -- one form whose evaluation order is guaranteed; a
+              -- non-matching hit yields NULL, which fails the >= and is
+              -- dropped — which is what we want for junk.
+              AND (CASE WHEN hit->>'ts' ~ '^\d{{4}}-\d{{2}}-\d{{2}}[T ]'
+                        THEN (hit->>'ts')::timestamptz END) >= %s
             """,
             rl_args,
         ).fetchall()
