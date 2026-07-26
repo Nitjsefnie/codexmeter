@@ -240,9 +240,14 @@ def _parse_legacy(file_key: str, blob: bytes) -> dict:
             # Consume the anchor once we record a StatusUpdate for this turn
             pending_turn_begin_ts = None
 
-            # Kimi wire format does not embed model per event; fall back to a
-            # hardcoded time-based assignment using the session's first event.
-            model = _model_for(None, first_event_ts)
+            # Legacy transcripts carry no model string anywhere — verified
+            # across the corpus: StatusUpdate payloads expose only
+            # context_usage / context_tokens / max_context_tokens /
+            # token_usage / message_id / plan_mode / mcp_status. Dates are all
+            # we have here. Use the RECORD's own ts so a session spanning a
+            # cutoff splits correctly; first_event_ts is only the fallback for
+            # a record with no timestamp of its own.
+            model = _model_for(None, ts_dt or first_event_ts)
             cost = pricing.compute_cost(
                 model,
                 fresh=fresh, create=create, read=read, output=output,
@@ -520,7 +525,11 @@ def _parse_kimi_code(file_key: str, blob: bytes) -> dict:
                     reply_latency_s = delta_s
             pending_turn_begin_ts = None
 
-            model = _model_for(None, first_event_ts)
+            # Every usage.record names its model (verified: 7,397/7,397 in the
+            # corpus, values "kimi-code/k3" and "kimi-code/kimi-for-coding").
+            # Honour it; dates decide only what the wire cannot express.
+            # Per-record ts, because a session can switch model mid-flight.
+            model = _model_for(obj.get("model"), ts_dt or first_event_ts)
             cost = pricing.compute_cost(
                 model,
                 fresh=fresh, create=create, read=read, output=output,

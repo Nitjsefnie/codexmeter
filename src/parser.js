@@ -4,7 +4,7 @@
  */
 
 // Must match backend PARSER_VERSION (see backend/.env.example).
-window.PARSER_VERSION = "5";
+window.PARSER_VERSION = "6";
 
 const MODEL_RATES = {
   "kimi-k3":        { fresh: 3.00, create: 0.00, read: 0.30, output: 15.00 },
@@ -16,12 +16,14 @@ const DEFAULT_RATES = MODEL_RATES["kimi-k2-6"];
 
 // Hardcoded model transitions, oldest first.  Each constant is a frozen UTC
 // epoch, NOT a live expression.  Boundaries are strictly-before /
-// inclusive-at, so each cutoff instant belongs to the NEWER model:
-//   < MODEL_CUTOFF_EPOCH -> kimi-k2-6
-//   < K3_CUTOFF_EPOCH    -> kimi-k2-7-code
-//   >=K3_CUTOFF_EPOCH    -> kimi-k3
+// inclusive-at, so each cutoff instant belongs to the NEWER model.
+// MODEL_CUTOFF applies to any record the wire did not settle; K3_CUTOFF
+// applies ONLY to records with no wire model string at all.
 const MODEL_CUTOFF_EPOCH = 1781217035;  // 2026-06-11 22:30:35 UTC
-const K3_CUTOFF_EPOCH = 1784214394;     // 2026-07-16 15:06:34 UTC
+// 2026-07-16 14:45:55 UTC — the earliest observed k3 usage.record. MUST match
+// backend/parse.py K3_CUTOFF_EPOCH; the previous value here (1784214394,
+// 15:06:34) postdated real k3 usage and had drifted 20m39s from the backend.
+const K3_CUTOFF_EPOCH = 1784213155;
 
 function tsToEpoch(ts) {
   if (ts == null) return null;
@@ -30,13 +32,40 @@ function tsToEpoch(ts) {
   return isNaN(d.getTime()) ? null : d.getTime() / 1000;
 }
 
-// Mirrors backend/parse.py _model_for, including the no-timestamp fallback to
-// kimi-k2-7-code (an unstamped session is already-ingested history, so it
-// cannot postdate the K3 cutoff, and K3's rates are ~3x higher).
-function modelForSession(firstEventTs) {
-  const epoch = tsToEpoch(firstEventTs);
+// Raw provider id -> canonical pricing label. Mirrors backend/parse.py
+// _WIRE_MODEL_MAP. Only ids that identify a pricing model on their own belong
+// here; "kimi-for-coding" spans both k2 generations and deliberately does not.
+const WIRE_MODEL_MAP = { "k3": "kimi-k3" };
+
+// Mirrors backend/parse.py _canonical_model. Returns null when the wire cannot
+// settle the model alone. Canonicalising BEFORE any rate lookup is mandatory:
+// rateForModel matches by substring, so a raw "kimi-code/k3" matches no key and
+// silently bills at DEFAULT_RATES (k2-6) — a ~3x undercount.
+function canonicalModel(wireModel) {
+  if (!wireModel) return null;
+  const tail = String(wireModel).split("/").pop();
+  return WIRE_MODEL_MAP[tail] || null;
+}
+
+// Mirrors backend/parse.py _model_for. Per-RECORD, not per-session: a session
+// can switch model mid-flight. Only ever returns one of the three canonical
+// labels — anything else means the ladder is broken.
+function modelFor(wireModel, ts) {
+  const canonical = canonicalModel(wireModel);
+  if (canonical !== null) return canonical;
+
+  const epoch = tsToEpoch(ts);
+  // An unstamped record is already-ingested history, so it cannot postdate the
+  // K3 cutoff, and K3's rates are ~3x higher.
   if (epoch == null) return "kimi-k2-7-code";
+
   if (epoch < MODEL_CUTOFF_EPOCH) return "kimi-k2-6";
+
+  // The wire named a model and it is not k3 (canonicalModel would have caught
+  // it), so the date may only separate the k2 generations — never promote an
+  // unrecognized id to k3.
+  if (wireModel) return "kimi-k2-7-code";
+
   if (epoch < K3_CUTOFF_EPOCH) return "kimi-k2-7-code";
   return "kimi-k3";
 }
@@ -261,7 +290,8 @@ function _parseLegacy(blob) {
     }
   }
 
-  // First event timestamp drives the per-session model label.
+  // Only a per-record fallback now: a record with no timestamp of its own
+  // borrows the session's first event rather than going unlabelled.
   let firstEventTs = null;
   for (const e of events) {
     if (e.ts != null) { firstEventTs = e.ts; break; }
@@ -271,8 +301,6 @@ function _parseLegacy(blob) {
       if (m.ts != null) { firstEventTs = m.ts; break; }
     }
   }
-  const sessionModel = modelForSession(firstEventTs);
-
   // Build records from status_updates
   const records = [];
   let prevInput = 0;
@@ -288,7 +316,10 @@ function _parseLegacy(blob) {
     const output = tu.output || 0;
     const totalInput = fresh + create + read;
 
-    const rates = window.rateForModel(sessionModel);
+    // Legacy transcripts carry no model string, so this resolves by date —
+    // but per RECORD, so a session spanning a cutoff splits correctly.
+    const model = modelFor(null, m.ts != null ? m.ts : firstEventTs);
+    const rates = window.rateForModel(model);
     const cost = (
       fresh * rates.fresh / 1e6 +
       create * rates.create / 1e6 +
@@ -300,7 +331,7 @@ function _parseLegacy(blob) {
       line_num: m.line,
       uuid: m.message_id || null,
       ts: m.ts,
-      model: sessionModel,
+      model,
       fresh_tokens: fresh,
       cache_creation_tokens: create,
       cache_read_tokens: read,
@@ -513,7 +544,9 @@ function _parseKimiCode(blob) {
 
     if (typ === "usage.record") {
       const usage = obj.usage || {};
-      const model = obj.model || "";
+      // The RAW provider id ("kimi-code/k3"). Never price or label with this
+      // directly — it is canonicalised per record below.
+      const wireModel = obj.model || null;
       const fresh = usage.inputOther || 0;
       const create = usage.inputCacheCreation || 0;
       const read = usage.inputCacheRead || 0;
@@ -527,14 +560,6 @@ function _parseKimiCode(blob) {
       }
       pendingTurnBeginTs = null;
 
-      const rates = window.rateForModel(model);
-      const cost = (
-        fresh * rates.fresh / 1e6 +
-        create * rates.create / 1e6 +
-        read * rates.read / 1e6 +
-        output * rates.output / 1e6
-      );
-
       metaEvents.push({
         type: "status_update", ts, line: lineNum,
         token_usage: {
@@ -543,7 +568,7 @@ function _parseKimiCode(blob) {
           input_cache_read: read,
           output: output,
         },
-        model,
+        wire_model: wireModel,
         reply_latency_s: replyLatencyS,
         raw: obj,
       });
@@ -566,6 +591,17 @@ function _parseKimiCode(blob) {
     }
   }
 
+  // Per-record fallback only, for a record with no timestamp of its own.
+  let firstEventTs = null;
+  for (const e of events) {
+    if (e.ts != null) { firstEventTs = e.ts; break; }
+  }
+  if (firstEventTs == null) {
+    for (const m of metaEvents) {
+      if (m.ts != null) { firstEventTs = m.ts; break; }
+    }
+  }
+
   // Build records from status_updates
   const records = [];
   let prevInput = 0;
@@ -581,7 +617,9 @@ function _parseKimiCode(blob) {
     const output = tu.output || 0;
     const totalInput = fresh + create + read;
 
-    const rates = window.rateForModel(m.model || "");
+    // The wire names the model on every usage.record; honour it, canonicalised.
+    const model = modelFor(m.wire_model, m.ts != null ? m.ts : firstEventTs);
+    const rates = window.rateForModel(model);
     const cost = (
       fresh * rates.fresh / 1e6 +
       create * rates.create / 1e6 +
@@ -593,7 +631,7 @@ function _parseKimiCode(blob) {
       line_num: m.line,
       uuid: null,
       ts: m.ts,
-      model: m.model || "",
+      model,
       fresh_tokens: fresh,
       cache_creation_tokens: create,
       cache_read_tokens: read,
@@ -699,7 +737,11 @@ window.computeStats = function computeStats(events, metaEvents) {
 };
 
 window.computeCache = function computeCache(metaEvents, firstEventTs) {
-  const rates = window.rateForModel(modelForSession(firstEventTs));
+  // Cost is accumulated per record at that record's own rates — a session can
+  // span a cutoff or switch model mid-flight, so one session-wide rate would
+  // misprice part of it. The rates line below reports the dominant model.
+  const perModel = {};
+  let costFresh = 0, costRead = 0, costCreate = 0, costOutput = 0;
   let totalInputOther = 0;
   let totalOutput = 0;
   let totalCacheRead = 0;
@@ -711,10 +753,22 @@ window.computeCache = function computeCache(metaEvents, firstEventTs) {
     const tu = m.token_usage;
     if (!tu) continue;
     count++;
-    totalInputOther += tu.input_other || 0;
-    totalOutput += tu.output || 0;
-    totalCacheRead += tu.input_cache_read || 0;
-    totalCacheCreate += tu.input_cache_creation || 0;
+    const fresh = tu.input_other || 0;
+    const output = tu.output || 0;
+    const read = tu.input_cache_read || 0;
+    const create = tu.input_cache_creation || 0;
+    totalInputOther += fresh;
+    totalOutput += output;
+    totalCacheRead += read;
+    totalCacheCreate += create;
+
+    const model = modelFor(m.wire_model, m.ts != null ? m.ts : firstEventTs);
+    perModel[model] = (perModel[model] || 0) + 1;
+    const r = window.rateForModel(model);
+    costFresh += fresh * r.fresh / 1e6;
+    costRead += read * r.read / 1e6;
+    costCreate += create * r.create / 1e6;
+    costOutput += output * r.output / 1e6;
   }
 
   if (!count) return "CACHE / TOKEN USAGE\n" + "=" * 40 + "\n(no StatusUpdate with token_usage found)";
@@ -722,11 +776,17 @@ window.computeCache = function computeCache(metaEvents, firstEventTs) {
   const totalIn = totalInputOther + totalCacheRead + totalCacheCreate;
   const hit = totalIn ? (totalCacheRead / totalIn * 100.0) : 0.0;
 
-  const freshCost = totalInputOther * rates.fresh / 1e6;
-  const cacheReadCost = totalCacheRead * rates.read / 1e6;
-  const cacheCreateCost = totalCacheCreate * rates.create / 1e6;
-  const outputCost = totalOutput * rates.output / 1e6;
+  const freshCost = costFresh;
+  const cacheReadCost = costRead;
+  const cacheCreateCost = costCreate;
+  const outputCost = costOutput;
   const totalCost = freshCost + cacheReadCost + cacheCreateCost + outputCost;
+
+  // Dominant model, for the rates line only — the costs above are per-record.
+  const domModel = Object.keys(perModel).sort((a, b) => perModel[b] - perModel[a])[0]
+    || modelFor(null, firstEventTs);
+  const rates = window.rateForModel(domModel);
+  const mixed = Object.keys(perModel).length > 1;
 
   const lines = [
     "CACHE / TOKEN USAGE",
@@ -740,7 +800,7 @@ window.computeCache = function computeCache(metaEvents, firstEventTs) {
     `  hit rate:        ${hit.toFixed(1)}%`,
     "",
     "ESTIMATED BILLING",
-    `  Rates (USD per 1M tokens): fresh=$${rates.fresh.toFixed(2)}  cache_read=$${rates.read.toFixed(2)}  cache_create=$${rates.create.toFixed(2)}  output=$${rates.output.toFixed(2)}`,
+    `  Rates (USD per 1M tokens, ${domModel}${mixed ? " — dominant; costs below are per-record" : ""}): fresh=$${rates.fresh.toFixed(2)}  cache_read=$${rates.read.toFixed(2)}  cache_create=$${rates.create.toFixed(2)}  output=$${rates.output.toFixed(2)}`,
     `  ${"Category".padEnd(20)} ${"Cost".padStart(10)}`,
     `  ${"-".repeat(20)} ${"-".repeat(10)}`,
     freshCost ? `  ${"Fresh input".padEnd(20)} $${freshCost.toFixed(2).padStart(9)}` : "",

@@ -228,9 +228,12 @@ def test_missing_timestamp_still_labels_k2_7_code():
     assert out["records"][0]["model"] == "kimi-k2-7-code"
 
 
-def test_kimi_code_post_k3_cutoff_is_coerced_to_k3():
-    """kimi-code wires take the date-based label too — the embedded raw
-    provider id stays ignored across the K3 boundary.
+def test_kimi_code_post_k3_cutoff_kimi_for_coding_stays_k2_7_code():
+    """A wire that says kimi-for-coding is NOT k3, whatever the date.
+
+    This test previously asserted the opposite — that the date promoted it to
+    k3 — which was the bug: k2.7-code remains selectable after the K3 cutoff,
+    so a date cannot override a wire string that names a different model.
     """
     ms = int((parse.K3_CUTOFF_EPOCH + 10) * 1000)
     blob = (
@@ -243,9 +246,9 @@ def test_kimi_code_post_k3_cutoff_is_coerced_to_k3():
     ) % (ms, ms + 1000, ms + 2000)
     out = parse.parse_file("sessions/projKC/sess-k3/wire.jsonl", blob)
     r = out["records"][0]
-    assert r["model"] == "kimi-k3"
+    assert r["model"] == "kimi-k2-7-code"
     expected_cost = pricing.compute_cost(
-        "kimi-k3",
+        "kimi-k2-7-code",
         fresh=1000, create=50, read=100, output=200,
     )
     assert r["cost_usd"] == pytest.approx(expected_cost, rel=1e-9)
@@ -335,9 +338,11 @@ def test_kimi_code_usage_record_drives_record_and_turn():
     assert t["delta"] == 1150
 
 
-def test_kimi_code_raw_provider_model_is_coerced_by_date():
-    """kimi-code usage.record embeds the raw provider id; parse.py must
-    ignore it and assign the pricing model by first_event_ts.
+def test_kimi_code_ambiguous_wire_id_falls_through_to_the_date():
+    """kimi-code usage.record embeds the raw provider id and parse.py honors
+    it — but "kimi-for-coding" spans both k2 generations, so it cannot settle
+    the model alone and the date decides between them. Fixture is stamped
+    2026-07-02, i.e. after MODEL_CUTOFF, so it lands on kimi-k2-7-code.
     """
     out = parse.parse_file(
         "sessions/projKC/sess-kc/wire.jsonl", _read("kimi_code_raw_model.jsonl")
@@ -352,9 +357,9 @@ def test_kimi_code_raw_provider_model_is_coerced_by_date():
     assert r["cost_usd"] == pytest.approx(expected_cost, rel=1e-9)
 
 
-def test_kimi_code_pre_cutoff_raw_provider_model_is_coerced_to_k2_6():
-    """A kimi-code wire whose first event is before MODEL_CUTOFF_EPOCH must
-    be labelled kimi-k2-6 regardless of the embedded usage.record model.
+def test_kimi_code_pre_cutoff_ambiguous_wire_id_resolves_to_k2_6():
+    """"kimi-for-coding" cannot settle the model alone, so a record stamped
+    before MODEL_CUTOFF_EPOCH resolves to kimi-k2-6 via the date rung.
     """
     # metadata.created_at of 1780000000000 ms is well before MODEL_CUTOFF_EPOCH.
     blob = (
@@ -410,3 +415,127 @@ def test_turn_begin_drives_turn_boundaries():
     assert out["ctx_turns"][0]["output"] == 2
     assert out["ctx_turns"][1]["input"] == 200   # a3 wins turn 2
     assert out["ctx_turns"][1]["delta"] == 100   # 200 - 100
+
+
+# --- wire-first model attribution, end to end -----------------------------
+# The ladder in _model_for was already correct and unit-tested; what was not
+# tested was that parse_file actually PASSES the wire model into it. It did
+# not — both call sites passed None — so the wire-first rung was dead code and
+# every kimi-code record was labelled by date alone. These cover the call
+# sites, not the ladder.
+
+def _kc_blob(rows):
+    """kimi-code wire from (epoch_seconds, model_or_None) pairs."""
+    head = (
+        b'{"type":"metadata","protocol_version":"1.4","created_at":%d}\n'
+        % int(rows[0][0] * 1000)
+    )
+    body = b""
+    for secs, model in rows:
+        ms = int(secs * 1000)
+        model_field = b'"model":"%s",' % model.encode() if model else b""
+        body += (
+            b'{"type":"usage.record","time":%d,%s'
+            b'"usage":{"inputOther":1000,"output":200,"inputCacheRead":100,'
+            b'"inputCacheCreation":50}}\n' % (ms, model_field)
+        )
+    return head + body
+
+
+VALID_MODELS = {"kimi-k3", "kimi-k2-7-code", "kimi-k2-6"}
+
+
+def test_kimi_code_k3_wire_string_wins_over_an_earlier_date():
+    """The whole point of the wire-first rung: a record the wire calls k3 is
+    k3 even before K3_CUTOFF. Real k3 records predate the constant.
+    """
+    out = parse.parse_file(
+        "sessions/projKC/sess-k3w/wire.jsonl",
+        _kc_blob([(parse.K3_CUTOFF_EPOCH - 3600, "kimi-code/k3")]),
+    )
+    r = out["records"][0]
+    assert r["model"] == "kimi-k3"
+
+
+def test_kimi_code_k3_record_is_priced_at_k3_rates():
+    """Guards the rate_for substring trap directly: a raw "kimi-code/k3"
+    reaching compute_cost would match no key and bill at DEFAULT_RATES
+    (k2-6) — a ~3x undercount that no label assertion would catch.
+    """
+    out = parse.parse_file(
+        "sessions/projKC/sess-k3p/wire.jsonl",
+        _kc_blob([(parse.K3_CUTOFF_EPOCH - 3600, "kimi-code/k3")]),
+    )
+    r = out["records"][0]
+    k3 = pricing.compute_cost("kimi-k3", fresh=1000, create=50, read=100, output=200)
+    k26 = pricing.compute_cost("kimi-k2-6", fresh=1000, create=50, read=100, output=200)
+    assert r["cost_usd"] == pytest.approx(k3, rel=1e-9)
+    assert r["cost_usd"] != pytest.approx(k26, rel=1e-9), "billed at DEFAULT_RATES"
+
+
+def test_kimi_code_mid_session_model_switch_yields_two_labels():
+    """Model is resolved per RECORD, not per session. A session that switches
+    kimi-for-coding -> k3 mid-flight must produce both labels; using the
+    session's first event for every record collapsed them into one.
+    """
+    base = parse.K3_CUTOFF_EPOCH - 3600
+    out = parse.parse_file(
+        "sessions/projKC/sess-mix/wire.jsonl",
+        _kc_blob([(base, "kimi-code/kimi-for-coding"), (base + 24, "kimi-code/k3")]),
+    )
+    assert [r["model"] for r in out["records"]] == ["kimi-k2-7-code", "kimi-k3"]
+
+
+def test_legacy_records_split_across_the_model_cutoff():
+    """Legacy transcripts have no model string, so dates are all we have —
+    but applied per record, so a session straddling MODEL_CUTOFF splits
+    instead of taking one label from its first event.
+    """
+    before = parse.MODEL_CUTOFF_EPOCH - 60
+    after = parse.MODEL_CUTOFF_EPOCH + 60
+    blob = b""
+    for secs in (before, after):
+        ts = datetime.fromtimestamp(secs, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        blob += (
+            b'{"timestamp": "%s", "message": {"type": "StatusUpdate", "payload": '
+            b'{"message_id": "m%d", "token_usage": {"input_other": 10, '
+            b'"input_cache_creation": 0, "input_cache_read": 0, "output": 5}}}}\n'
+            % (ts.encode(), secs)
+        )
+    out = parse.parse_file("sessions/projA/sess-split/wire.jsonl", blob)
+    assert [r["model"] for r in out["records"]] == ["kimi-k2-6", "kimi-k2-7-code"]
+
+
+def test_legacy_after_k3_cutoff_still_labels_k3():
+    """No regression on the real legacy files that sit after the K3 cutoff:
+    with no wire model, the date ladder's k3 rung still applies.
+    """
+    secs = parse.K3_CUTOFF_EPOCH + 3600
+    ts = datetime.fromtimestamp(secs, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    blob = (
+        b'{"timestamp": "%s", "message": {"type": "StatusUpdate", "payload": '
+        b'{"message_id": "m1", "token_usage": {"input_other": 10, '
+        b'"input_cache_creation": 0, "input_cache_read": 0, "output": 5}}}}\n'
+        % ts.encode()
+    )
+    out = parse.parse_file("sessions/projA/sess-late/wire.jsonl", blob)
+    assert out["records"][0]["model"] == "kimi-k3"
+
+
+def test_parser_only_ever_emits_the_three_canonical_models():
+    """There are exactly three real models. Anything else means a raw provider
+    id leaked past canonicalisation — which is precisely what would bill at
+    DEFAULT_RATES without any label looking obviously wrong.
+    """
+    base = parse.K3_CUTOFF_EPOCH - 3600
+    blob = _kc_blob([
+        (base, "kimi-code/k3"),
+        (base + 1, "kimi-code/kimi-for-coding"),
+        (base + 2, "kimi-code/k4-not-yet-invented"),
+        (base + 3, None),
+        (parse.MODEL_CUTOFF_EPOCH - 60, "kimi-code/k3"),
+    ])
+    out = parse.parse_file("sessions/projKC/sess-all/wire.jsonl", blob)
+    assert out["records"], "fixture must produce records"
+    for r in out["records"]:
+        assert r["model"] in VALID_MODELS, r["model"]
