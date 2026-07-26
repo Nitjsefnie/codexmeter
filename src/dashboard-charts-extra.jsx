@@ -445,12 +445,17 @@ function ContextGrowthPanel({ events, realSessions, ctxTraces }) {
         if (!t.turns || !t.turns.length) continue;
         const key = shortModelName(t.model);
         if (dropKey(key)) continue;
+        // turns arrives as a flat array of ctx values; the turn index is
+        // the position (it used to be sent as a redundant `t` field).
         const seq = [
           { t: 0, ctx: 0 },
-          ...t.turns.map(p => ({ t: p.t + 1, ctx: p.ctx })),
+          ...t.turns.map((ctx, i) => ({ t: i + 1, ctx })),
         ];
         if (!out[key]) out[key] = [];
-        out[key].push({ id: t.file_key || t.session_id, seq });
+        // No id: only `seq` is ever read off these, and carrying the
+        // file_key meant ~100 chars of string per trace, per trace in
+        // range, for a field nothing rendered.
+        out[key].push({ seq });
       }
       return out;
     }

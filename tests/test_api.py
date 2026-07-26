@@ -122,7 +122,7 @@ def test_projects(app_with_data):
     pids = sorted(p["project_id"] for p in body["projects"])
     assert pids == ["projA", "projB"]
     for p in body["projects"]:
-        assert "file_count" in p and "total_cost" in p
+        assert "session_count" in p and "total_cost" in p
 
 
 def test_cache_per_model_shape(app_with_data):
