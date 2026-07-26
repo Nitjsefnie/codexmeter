@@ -565,3 +565,34 @@ def test_dashboard_model_filter_does_not_500(app_with_data):
         r = app_with_data.get(f"/api/dashboard?range={rng}&model=no-such-model")
         assert r.status_code == 200, f"range={rng}: {r.status_code} {r.text[:200]}"
         assert r.json()["hourly"] == []
+
+
+def test_rate_limit_hits_are_filtered_on_the_hits_own_ts(app_with_fresh_data):
+    """A file touched inside the range can carry hits far older than it.
+
+    The query filtered on files.r2_last_modified alone, so re-archiving a
+    transcript today dragged every rate-limit hit it ever recorded into a
+    7-day view. The hit's own `ts` is what the panel plots, so that is what
+    must be filtered.
+    """
+    import psycopg
+    from backend import cache
+
+    with psycopg.connect(os.environ["DATABASE_URL_VIZ"]) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE files SET r2_last_modified = now(), "
+            "       rate_limit_hits = '[{\"ts\":\"2025-07-26T10:00:00Z\","
+            "                            \"content\":\"old hit\"}]'::jsonb "
+            " WHERE file_key = (SELECT MIN(file_key) FROM files WHERE is_main)"
+        )
+        conn.commit()
+
+    cache.response_cache.clear()
+    short = app_with_fresh_data.get("/api/dashboard?range=7d").json()
+    assert [h for h in short["rate_limit_hits"] if h["content"] == "old hit"] == [], \
+        "a >1y old hit must not appear in a 7-day view"
+
+    cache.response_cache.clear()
+    wide = app_with_fresh_data.get("/api/dashboard?range=3650d").json()
+    assert [h["content"] for h in wide["rate_limit_hits"] if h["content"] == "old hit"] \
+        == ["old hit"], "and the file's mtime clause must still let it through"

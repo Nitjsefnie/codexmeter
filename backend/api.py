@@ -1358,7 +1358,7 @@ def dashboard(
             ctx_traces_args,
         ).fetchall()
 
-        rl_args = list(file_args)
+        rl_args = list(file_args) + [since]
         rl_rows = ph.execute(
             "rate_limits", c,
             f"""
@@ -1366,6 +1366,11 @@ def dashboard(
             FROM files f, jsonb_array_elements(f.rate_limit_hits) AS hit
             WHERE f.r2_last_modified >= %s {proj_filter}
               AND jsonb_array_length(f.rate_limit_hits) > 0
+              -- r2_last_modified is the file's mtime, not the hit's time:
+              -- a file touched within range can still carry hits older
+              -- than `since`, so filter on each hit's own ts too. The
+              -- mtime clause stays as the coarse, indexable pre-filter.
+              AND NULLIF(hit->>'ts', '')::timestamptz >= %s
             """,
             rl_args,
         ).fetchall()
