@@ -12,7 +12,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 def _build_app(monkeypatch, pre_ingest=None, test_db="kimi_viz_test_api"):
     """Spin up a fresh DB + mini R2, optionally mutate the temp R2 tree,
-    ingest, and return a TestClient plus cleanup metadata.
+    ingest, and yield a TestClient on the api router — then tear it down.
 
     Bypasses auth via a clean FastAPI app with only the api router.
     """
@@ -44,11 +44,8 @@ def _build_app(monkeypatch, pre_ingest=None, test_db="kimi_viz_test_api"):
     a = FastAPI()
     a.include_router(api_mod.router)
 
-    return TestClient(a), tmp, test_db
+    yield TestClient(a)
 
-
-def _cleanup_app(tmp, test_db):
-    from backend import db as _db
     if _db._VIZ is not None:
         try:
             _db._VIZ.close()
@@ -59,29 +56,41 @@ def _cleanup_app(tmp, test_db):
     os.system(f"dropdb --if-exists {test_db} 2>/dev/null")
 
 
-@pytest.fixture
-def app_with_data(monkeypatch):
-    client, tmp, test_db = _build_app(monkeypatch)
-    yield client
-    _cleanup_app(tmp, test_db)
+# Module-scoped: this setup (dropdb, createdb, schema, copy the R2 tree,
+# a full ingest incl. recompute_canonical + rebuild_rollup) ran per test
+# and was seconds of pure `setup` on every one of ~40 read-only tests —
+# the bulk of the suite's runtime. Tests that WRITE must not share it;
+# they take `app_with_fresh_data` below.
+@pytest.fixture(scope="module")
+def app_with_data():
+    mp = pytest.MonkeyPatch()          # monkeypatch itself is function-scoped
+    try:
+        yield from _build_app(mp)
+    finally:
+        mp.undo()
 
 
 @pytest.fixture
-def app_with_fresh_data(monkeypatch):
-    """Same data as `app_with_data`, on a database of its own.
-
-    Tests that MUTATE the DB underneath the app belong here — sharing the
-    read-only fixture's database would leak the mutation into every test
-    that runs after them.
-    """
-    client, tmp, test_db = _build_app(monkeypatch, test_db="kimi_viz_test_api_mut")
-    yield client
-    _cleanup_app(tmp, test_db)
+def app_with_fresh_data():
+    """Function-scoped variant for tests that MUTATE rows, so they cannot
+    contaminate the shared module-scoped client."""
+    mp = pytest.MonkeyPatch()
+    try:
+        yield from _build_app(mp, test_db="kimi_viz_test_api_mut")
+    finally:
+        mp.undo()
 
 
 @pytest.fixture
-def app_with_unresolved(monkeypatch):
+def app_with_unresolved():
     """Plain fixture plus two junk hash-projects (no project.json marker).
+
+    Function-scoped ON PURPOSE, unlike `app_with_data`. Both fixtures point
+    the process-global DATABASE_URL_VIZ at their own database, so a
+    module-scoped one here would build once, leave the env pointing at the
+    junk DB, and every later `app_with_data` test would read it — the
+    cached module fixture never re-points anything. Function scope means
+    the MonkeyPatch undo restores the shared DSN after each test.
 
     One 32-hex legacy md5 id and one 12-hex kimi-code workdir hash id,
     each with a distinct session dir so session_count sees 2.
@@ -108,11 +117,13 @@ def app_with_unresolved(monkeypatch):
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(wire)
 
-    client, tmp, test_db = _build_app(
-        monkeypatch, pre_ingest=_inject_junk, test_db="kimi_viz_test_unres"
-    )
-    yield client
-    _cleanup_app(tmp, test_db)
+    mp = pytest.MonkeyPatch()
+    try:
+        yield from _build_app(
+            mp, pre_ingest=_inject_junk, test_db="kimi_viz_test_unres"
+        )
+    finally:
+        mp.undo()
 
 
 def test_projects(app_with_data):
@@ -377,9 +388,11 @@ def test_activity_heatmap_requests_match_dashboard(app_with_data):
            sum(h["requests"] for h in dash["hourly"])
 
 
-def test_activity_heatmap_dst_awareness(app_with_data):
+def test_activity_heatmap_dst_awareness(app_with_fresh_data):
+    # Inserts rows and rebuilds the rollup, so it needs its own database —
+    # the module-scoped client is shared with every read-only test.
     _insert_tz_probe_rows()
-    r = app_with_data.get("/api/activity-heatmap?range=3650d&model=tz-probe-model")
+    r = app_with_fresh_data.get("/api/activity-heatmap?range=3650d&model=tz-probe-model")
     assert r.status_code == 200
     cells = {(c["dow"], c["hour"]): c for c in r.json()["cells"]}
     assert set(cells) == {(4, 11), (3, 12)}, cells
