@@ -146,6 +146,18 @@ def _proj_semijoin(project: str | None, args: list) -> str:
     return "AND file_key IN (SELECT file_key FROM files WHERE project_id = %s)"
 
 
+def _proj_rollup(project: str | None, args: list) -> str:
+    """Same filter again, against `usage_rollup u`, which carries
+    project_id directly and so needs no join at all."""
+    if not project:
+        return ""
+    if project == UNRESOLVED_PROJECT_ID:
+        return ("AND u.project_id IN (SELECT project_id FROM projects "
+                f"WHERE {_unresolved_cond()})")
+    args.append(project)
+    return "AND u.project_id = %s"
+
+
 @router.get("/me")
 def me(request: Request) -> dict:
     """Identity probe — frontend uses `is_guest` to decide which UI
@@ -286,34 +298,34 @@ def activity_heatmap(
 
     dow is ISO (1=Mon … 7=Sun), hour 0–23. DST handled by Postgres
     tzdata via AT TIME ZONE — UTC+1 in winter (CET), UTC+2 in summer
-    (CEST). Cross-file uuid dedup comes from records.is_canonical, resolved
-    at ingest (SV-CANONICAL-FLAG)."""
+    (CEST).
+
+    Served from usage_rollup: the grid is weekday x hour of pure
+    sums/counts, which is exactly what the rollup holds, and its `hour`
+    column is already dedup-resolved. Truncating to the hour in UTC is
+    safe for this because HEATMAP_TZ's offsets are whole hours, so the
+    local hour bucket is preserved. There is no bucket-width gate here
+    (unlike /api/dashboard) — the grid is always hourly."""
     delta = _parse_range(range)
     since = datetime.now(timezone.utc) - delta
 
-    filt_args: list[Any] = [since]
-    proj_filter = _proj_filter(project, filt_args)
-    model_filter = ""
+    args: list[Any] = [HEATMAP_TZ, HEATMAP_TZ, since]
+    proj_filter = _proj_rollup(project, args)
+    model_filter = "AND u.model LIKE %s" if model else ""
     if model:
-        model_filter = "AND r.model LIKE %s"
-        filt_args.append(f"%{model}%")
-    args = [HEATMAP_TZ, HEATMAP_TZ] + filt_args
-    # The JOIN exists only to resolve project_id; without a project filter
-    # it is a join against every file for nothing.
-    join_files = "JOIN files f ON f.file_key = r.file_key" if proj_filter else ""
+        args.append(f"%{model}%")
 
     with db.viz_conn() as c:
         rows = c.execute(
             f"""
-            SELECT EXTRACT(ISODOW FROM (r.ts AT TIME ZONE %s))::int AS dow,
-                   EXTRACT(HOUR   FROM (r.ts AT TIME ZONE %s))::int AS hour,
-                   COUNT(*)             AS requests,
-                   SUM(r.output_tokens) AS output_tokens,
-                   SUM(r.cost_usd)      AS cost_usd
-            FROM records r
-            {join_files}
-            WHERE r.is_canonical AND r.ts >= %s {proj_filter} {model_filter}
-              AND r.ts IS NOT NULL
+            SELECT EXTRACT(ISODOW FROM (u.hour AT TIME ZONE %s))::int AS dow,
+                   EXTRACT(HOUR   FROM (u.hour AT TIME ZONE %s))::int AS hour,
+                   SUM(u.requests)      AS requests,
+                   SUM(u.output_tokens) AS output_tokens,
+                   SUM(u.cost_usd)      AS cost_usd
+            FROM usage_rollup u
+            WHERE u.hour >= date_trunc('hour', %s::timestamptz)
+              {proj_filter} {model_filter}
             GROUP BY 1, 2
             ORDER BY 1, 2
             """,
@@ -531,7 +543,17 @@ def list_models() -> dict:
 @router.get("/projects")
 @cache_response
 def list_projects() -> dict:
-    """Per-project rollup: file_count, total_cost, derived from files+records."""
+    """Per-project rollup: file_count, total_cost, derived from files+records.
+
+    Cost comes from usage_rollup instead of joining every record: this used
+    to fan `projects x files x records` out to a row per record, and was
+    the slowest uncached call on a page load after /api/dashboard.
+
+    The aggregates are computed in separate subqueries rather than by
+    stacking two LEFT JOINs — joining files AND records first multiplied
+    the file rows by their record count, so COUNT(f.file_key) reported a
+    file total inflated by the average records-per-file.
+    """
     with db.viz_conn() as c:
         cond = _unresolved_cond("p.")
         rows = c.execute(
@@ -540,12 +562,20 @@ def list_projects() -> dict:
                         ELSE p.project_id END   AS project_id,
                    CASE WHEN {cond} THEN '<unresolved>'
                         ELSE p.display_name END AS display_name,
-                   COUNT(DISTINCT f.session_id) AS session_count,
-                   COUNT(f.file_key)            AS file_count,
-                   COALESCE(SUM(r.cost_usd), 0) AS total_cost
+                   COALESCE(SUM(fc.session_count), 0) AS session_count,
+                   COALESCE(SUM(fc.file_count), 0)    AS file_count,
+                   COALESCE(SUM(uc.total_cost), 0)    AS total_cost
             FROM projects p
-            LEFT JOIN files f   ON f.project_id = p.project_id
-            LEFT JOIN records r ON r.file_key   = f.file_key
+            LEFT JOIN (
+              SELECT project_id,
+                     COUNT(DISTINCT session_id) AS session_count,
+                     COUNT(*)                   AS file_count
+              FROM files GROUP BY project_id
+            ) fc ON fc.project_id = p.project_id
+            LEFT JOIN (
+              SELECT project_id, SUM(cost_usd) AS total_cost
+              FROM usage_rollup GROUP BY project_id
+            ) uc ON uc.project_id = p.project_id
             GROUP BY 1, 2
             ORDER BY total_cost DESC
             """
@@ -1005,8 +1035,11 @@ def dashboard(
     # express. For those the live subquery below is shaped with the SAME
     # column names, so every query after this point is written once.
     use_rollup = bucket_s >= 3600
-    roll_proj = "AND u.project_id = %s" if project else ""
+    roll_args: list[Any] = [since]
+    roll_proj = _proj_rollup(project, roll_args)
     roll_model = "AND u.model LIKE %s" if model else ""
+    if model:
+        roll_args.append(f"%{model}%")
     if use_rollup:
         roll_from = "usage_rollup u"
         # date_trunc so the partial hour containing `since` is included
@@ -1029,11 +1062,6 @@ def dashboard(
         FROM {roll_from}
         WHERE {roll_since} {roll_proj} {roll_model}
     """
-    roll_args: list[Any] = [since]
-    if project:
-        roll_args.append(project)
-    if model:
-        roll_args.append(f"%{model}%")
 
     ph = Phases("dashboard")
 
@@ -1093,24 +1121,29 @@ def dashboard(
         file_counts_row = ph.execute(
             "file_counts", c,
             f"""
+            -- The EXISTS predicates were correlated subqueries evaluated
+            -- once per file row (four of them, across every file).
+            -- Resolve each to a set once and LEFT JOIN instead.
+            WITH files_with_records AS (
+              SELECT file_key FROM records GROUP BY file_key
+            ),
+            sessions_with_main AS (
+              SELECT session_id FROM files WHERE is_main GROUP BY session_id
+            )
             SELECT
-              COUNT(*) FILTER (WHERE is_main AND EXISTS (
-                SELECT 1 FROM records r WHERE r.file_key = f.file_key
-              )) AS main_w_usage,
-              COUNT(*) FILTER (WHERE is_main AND NOT EXISTS (
-                SELECT 1 FROM records r WHERE r.file_key = f.file_key
-              )) AS main_empty,
-              COUNT(*) FILTER (WHERE NOT is_main) AS subagent_files,
+              COUNT(*) FILTER (
+                WHERE f.is_main AND fr.file_key IS NOT NULL
+              ) AS main_w_usage,
+              COUNT(*) FILTER (
+                WHERE f.is_main AND fr.file_key IS NULL
+              ) AS main_empty,
+              COUNT(*) FILTER (WHERE NOT f.is_main) AS subagent_files,
               COUNT(DISTINCT f.session_id) FILTER (
-                WHERE NOT EXISTS (
-                  SELECT 1 FROM files mf
-                  WHERE mf.session_id = f.session_id AND mf.is_main
-                )
-                AND EXISTS (
-                  SELECT 1 FROM records r WHERE r.file_key = f.file_key
-                )
+                WHERE sm.session_id IS NULL AND fr.file_key IS NOT NULL
               ) AS subagent_only_sessions
             FROM files f
+            LEFT JOIN files_with_records fr ON fr.file_key = f.file_key
+            LEFT JOIN sessions_with_main   sm ON sm.session_id = f.session_id
             WHERE f.r2_last_modified >= %s {proj_filter}
             """,
             file_counts_args,
@@ -1178,22 +1211,6 @@ def dashboard(
         # responses" with "more thinking". Character count of text
         # content blocks is the clean, model-fair "visible response
         # size" measure.
-        ctx_turns_args = list(args)
-        # ctx_turns for the parent-session (main) files only — used to
-        # join into per-folder `sessions_out` rows for the burn-rate
-        # tooltip's ctx_at_end and the burn dot scaling.
-        ctx_turns_rows = ph.execute(
-            "ctx_turns", c,
-            f"""
-            SELECT f.session_id, f.ctx_turns
-            FROM files f
-            WHERE f.is_main
-              AND f.r2_last_modified >= %s {proj_filter}
-              AND jsonb_array_length(f.ctx_turns) > 0
-            """,
-            ctx_turns_args,
-        ).fetchall()
-
         # Per-FILE ctx traces — one row per main file AND per sub-agent
         # file with usage. The "Per-Session Context Growth" panel
         # treats each file as its own conversation, so a sub-agent
@@ -1203,7 +1220,16 @@ def dashboard(
         ctx_traces_rows = ph.execute(
             "ctx_traces", c,
             f"""
-            WITH file_models AS (
+            WITH scoped_files AS (
+              SELECT f.file_key, f.session_id, f.is_main, f.ctx_turns
+              FROM files f
+              WHERE f.r2_last_modified >= %s {proj_filter}
+                AND jsonb_array_length(f.ctx_turns) > 0
+            ),
+            -- Scoped to the files actually returned. Unrestricted, this
+            -- ran an ordered-set aggregate over every record in the
+            -- table on every request, ignoring both range and project.
+            file_models AS (
               SELECT r.file_key,
                      COALESCE(
                        MODE() WITHIN GROUP (ORDER BY r.model) FILTER (
@@ -1212,15 +1238,14 @@ def dashboard(
                        MODE() WITHIN GROUP (ORDER BY NULLIF(r.model, ''))
                      ) AS model
               FROM records r
+              WHERE r.file_key IN (SELECT file_key FROM scoped_files)
               GROUP BY r.file_key
             )
-            SELECT f.file_key, f.session_id, f.is_main,
+            SELECT sf.file_key, sf.session_id, sf.is_main,
                    COALESCE(fm.model, '') AS model,
-                   f.ctx_turns
-            FROM files f
-            LEFT JOIN file_models fm ON fm.file_key = f.file_key
-            WHERE f.r2_last_modified >= %s {proj_filter}
-              AND jsonb_array_length(f.ctx_turns) > 0
+                   sf.ctx_turns
+            FROM scoped_files sf
+            LEFT JOIN file_models fm ON fm.file_key = sf.file_key
             """,
             ctx_traces_args,
         ).fetchall()
@@ -1260,15 +1285,20 @@ def dashboard(
         ctx_rows = ph.execute(
             "ctx_lines", c,
             f"""
+            -- The ordering cost was a correlated SUM over `records`
+            -- evaluated once per candidate file. Aggregate per file_key
+            -- once and join, so the sort reads a prepared column.
+            WITH cost_per_file AS (
+              SELECT file_key, SUM(cost_usd) AS cost
+              FROM records GROUP BY file_key
+            )
             SELECT f.session_id, f.ctx_turns
             FROM files f
+            LEFT JOIN cost_per_file cf ON cf.file_key = f.file_key
             WHERE f.is_main
               AND f.r2_last_modified >= %s {proj_filter}
               AND jsonb_array_length(f.ctx_turns) > 0
-            ORDER BY (
-              SELECT COALESCE(SUM(cost_usd), 0) FROM records r
-              WHERE r.file_key = f.file_key
-            ) DESC
+            ORDER BY COALESCE(cf.cost, 0) DESC
             LIMIT 20
             """,
             ctx_args,
@@ -1361,7 +1391,13 @@ def dashboard(
         reverse=True,
     )
 
-    ctx_turns_by_session = {sid: turns for (sid, turns) in ctx_turns_rows}
+    # ctx_turns used to be its own query, but it is a strict subset of
+    # ctx_traces (main files only) — the same jsonb scan run twice.
+    ctx_turns_by_session = {
+        sid: turns
+        for (fk, sid, is_main, mdl, turns) in ctx_traces_rows
+        if is_main
+    }
     sessions_out = []
     for row in sessions_rows:
         (sid, st, et, reqs, inp, out, cr, cost, dom, models_used) = row
