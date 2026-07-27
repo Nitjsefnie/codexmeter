@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import lzma
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,6 +36,14 @@ log = logging.getLogger("kimimeter.ingest")
 # OSError alone would miss exactly the drops this retry exists for.
 # Deliberately NOT `Exception`: see FatalFetchError.
 TRANSIENT_FETCH_ERRORS = (OSError, BotoCoreError, ClientError)
+
+# A corrupt object, not a corrupt connection. r2.get_object inflates `.xz`
+# keys transparently, so lzma raises from INSIDE the fetch — and every
+# production object is `.xz`, which makes this the likeliest per-object
+# failure there is. It is deterministic: retrying cannot un-truncate an
+# upload, and treating it as a bug would abort the whole run over one bad
+# file, which is the exact failure issue #3 is about.
+CORRUPT_PAYLOAD_ERRORS = (lzma.LZMAError, EOFError)
 
 
 class FatalFetchError(Exception):
@@ -615,15 +624,23 @@ def _fetch_with_retry(key: str) -> bytes:
     ingest, which walks the whole bucket in one pass, needs to ride out a
     transient drop.
 
-    Anything outside TRANSIENT_FETCH_ERRORS is a bug, not a dropped
-    connection, and is re-raised as FatalFetchError so the per-object
-    collector does not absorb it: a TypeError inside get_object would
-    otherwise become a 1,464-object "partial run" that slept 37 minutes
-    through the same bug instead of raising one loud traceback.
+    Three outcomes, because "did that fail" is three questions, not two:
+
+    - TRANSIENT_FETCH_ERRORS — retry, then propagate so the caller books
+      one per-object failure.
+    - CORRUPT_PAYLOAD_ERRORS — propagate on the FIRST attempt. Also one
+      per-object failure, but no retry: the bytes will not improve.
+    - anything else — a bug, re-raised as FatalFetchError so the
+      per-object collector does not absorb it. A TypeError inside
+      get_object would otherwise become a 1,464-object "partial run" that
+      slept 37 minutes through the same bug instead of raising one loud
+      traceback.
     """
     for attempt in range(1, FETCH_ATTEMPTS + 1):
         try:
             return r2.get_object(key)
+        except CORRUPT_PAYLOAD_ERRORS:
+            raise
         except TRANSIENT_FETCH_ERRORS:
             if attempt == FETCH_ATTEMPTS:
                 raise

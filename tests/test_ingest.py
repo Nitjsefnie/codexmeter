@@ -1,4 +1,5 @@
 import json
+import lzma
 import os
 import shutil
 import tempfile
@@ -467,6 +468,47 @@ def test_fetch_gives_up_after_three_attempts(
     assert "connection reset" not in (result["error"] or ""), \
         "the summary names keys, not stack noise"
     assert _FLAKY_KEY in result["error"]
+
+
+_CORRUPT_XZ_KEY = "sessions/projC/sess-E/wire.jsonl.xz"
+
+
+def test_a_corrupt_xz_object_is_one_failure_not_a_dead_run(
+    fresh_db, mini_r2_env, monkeypatch
+):
+    """Real invalid bytes under a `.xz` key, not a monkeypatched raise.
+
+    r2.get_object inflates `.xz` transparently, so lzma raises from inside
+    the fetch — and lzma.LZMAError is not an OSError. Every production
+    object is `.xz`, so classifying it as "not transient, therefore a bug"
+    would abort the entire run over one truncated upload: issue #3's
+    original failure mode, for 100% of the bucket.
+    """
+    corrupt = mini_r2_env / "sessions" / "projC" / "sess-E" / "wire.jsonl.xz"
+    corrupt.parent.mkdir(parents=True)
+    corrupt.write_bytes(b"\xfd7zXZ\x00 this is not a valid xz stream \x00\x01")
+    with pytest.raises(lzma.LZMAError):
+        lzma.decompress(corrupt.read_bytes())      # the fixture must really be corrupt
+
+    counts, slept = _patch_fetch(monkeypatch, _CORRUPT_XZ_KEY, fail_times=0)
+
+    result = ingest.run_ingest(trigger="manual")
+
+    assert result["r2_listed"] == 6
+    assert result["failed"] == 1
+    assert result["error"] == (
+        f"1 object failed after retries: {_CORRUPT_XZ_KEY}"
+    )
+    assert result["inserted"] == 5, "the intact objects are still persisted"
+    assert counts[_CORRUPT_XZ_KEY] == 1, "a corrupt object must not be re-fetched"
+    assert slept == [], "and must not sleep between attempts it does not make"
+    with db.viz_conn() as c:
+        rollup = c.execute("SELECT COUNT(*) FROM usage_rollup").fetchone()[0]
+        stored = c.execute(
+            "SELECT COUNT(*) FROM files WHERE file_key = %s", (_CORRUPT_XZ_KEY,)
+        ).fetchone()[0]
+    assert rollup > 0, "derived state must still be rebuilt"
+    assert stored == 0
 
 
 def test_a_programming_error_in_the_fetch_is_not_retried(
