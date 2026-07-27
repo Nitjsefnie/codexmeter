@@ -368,7 +368,13 @@ def rebuild_tool_rollup() -> int:
     """
     with db.viz_conn() as c:
         c.execute("SET LOCAL work_mem = '64MB'")
-        c.execute("TRUNCATE tool_rollup")
+        # DELETE, not TRUNCATE: TRUNCATE takes an ACCESS EXCLUSIVE lock for
+        # the whole rebuild transaction, so every concurrent read of this
+        # table blocks until it commits — measured at 2.9s for a SELECT that
+        # normally takes 0.07s. The rebuild runs on every ingest, so that
+        # stalled readers hourly. DELETE takes ROW EXCLUSIVE and MVCC keeps
+        # serving the previous rows until commit, so readers never wait.
+        c.execute("DELETE FROM tool_rollup")
         cur = c.execute(
             """
             INSERT INTO tool_rollup (
@@ -398,6 +404,10 @@ def rebuild_tool_rollup() -> int:
 # it, and that range stays on the live path.
 LATENCY_BUCKETS = (3600, 21600, 43200, 86400)
 
+# Ranges warm_common pre-populates. Mirrors RangePicker's presets in
+# src/app.jsx; anything the UI can request but this omits stays cold.
+WARM_RANGES = ("all", "365d", "90d", "30d", "7d", "1d")
+
 
 def rebuild_latency_rollup() -> int:
     """Rebuild `latency_rollup` for each display bucket width.
@@ -410,7 +420,13 @@ def rebuild_latency_rollup() -> int:
     written = 0
     with db.viz_conn() as c:
         c.execute("SET LOCAL work_mem = '128MB'")
-        c.execute("TRUNCATE latency_rollup")
+        # DELETE, not TRUNCATE: TRUNCATE takes an ACCESS EXCLUSIVE lock for
+        # the whole rebuild transaction, so every concurrent read of this
+        # table blocks until it commits — measured at 2.9s for a SELECT that
+        # normally takes 0.07s. The rebuild runs on every ingest, so that
+        # stalled readers hourly. DELETE takes ROW EXCLUSIVE and MVCC keeps
+        # serving the previous rows until commit, so readers never wait.
+        c.execute("DELETE FROM latency_rollup")
         for bs in LATENCY_BUCKETS:
             for scope_expr, scope_join in (
                 ("f.project_id", "JOIN files f ON f.file_key = r.file_key"),
@@ -500,15 +516,23 @@ def warm_common() -> None:
 
     from backend import api
 
-    ranges = ("all", "30d", "7d")
-    for rng in ranges:
+    # Every range the picker offers, so no button lands on a cold query.
+    # Must mirror RangePicker's preset values in src/app.jsx — a range the
+    # UI can request but this does not list is a permanently cold key.
+    # ("1d" matters most: its 5-minute buckets are below the rollups' 1h
+    # gate, so it is the only range still served by live queries.)
+    for rng in WARM_RANGES:
         cache.warm(api.dashboard, range=rng)
         cache.warm(api.activity_heatmap, range=rng)
         cache.warm(api.tool_usage, range=rng)
         cache.warm(api.tool_error_rate, range=rng)
         cache.warm(api.reply_latency, range=rng)
-    cache.warm(api.list_projects)
-    log.info("warm_common: queued %d range(s)", len(ranges))
+        # /api/projects is range-scoped, so it needs warming per range like
+        # everything else. Warming it bare took the endpoint's own
+        # signature default ("30d") while the UI opens on "all", leaving
+        # the one request every page load makes permanently uncached.
+        cache.warm(api.list_projects, range=rng)
+    log.info("warm_common: queued %d range(s)", len(WARM_RANGES))
 
 
 def recompute_canonical() -> int:
@@ -569,7 +593,13 @@ def rebuild_rollup() -> int:
     """
     with db.viz_conn() as c:
         c.execute("SET LOCAL work_mem = '64MB'")
-        c.execute("TRUNCATE usage_rollup")
+        # DELETE, not TRUNCATE: TRUNCATE takes an ACCESS EXCLUSIVE lock for
+        # the whole rebuild transaction, so every concurrent read of this
+        # table blocks until it commits — measured at 2.9s for a SELECT that
+        # normally takes 0.07s. The rebuild runs on every ingest, so that
+        # stalled readers hourly. DELETE takes ROW EXCLUSIVE and MVCC keeps
+        # serving the previous rows until commit, so readers never wait.
+        c.execute("DELETE FROM usage_rollup")
         cur = c.execute(
             """
             INSERT INTO usage_rollup (

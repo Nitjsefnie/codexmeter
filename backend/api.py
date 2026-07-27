@@ -41,15 +41,20 @@ log = logging.getLogger("kimimeter.api")
 # happens outside SQL (row marshalling, response serialisation).
 TIMING_ON = os.environ.get("KIMIMETER_TIMING", "").lower() not in ("", "0", "false", "no")
 
-if TIMING_ON and not log.handlers:
+_KIMIMETER_LOGGER = logging.getLogger("kimimeter")
+
+if TIMING_ON and not _KIMIMETER_LOGGER.handlers:
     # uvicorn configures its own loggers and leaves the root logger at
     # WARNING, so a bare log.info() here would go nowhere. Attach our own
     # handler rather than depending on someone else's logging config.
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter("%(levelname)s:     %(message)s"))
-    log.addHandler(_handler)
-    log.setLevel(logging.INFO)
-    log.propagate = False
+    # Attached to the "kimimeter" PARENT, not "kimimeter.api": ingest logs
+    # under "kimimeter.ingest" and was silently discarded, so
+    # recompute_canonical / rebuild_* / warm_common reported nothing.
+    _KIMIMETER_LOGGER.addHandler(_handler)
+    _KIMIMETER_LOGGER.setLevel(logging.INFO)
+    _KIMIMETER_LOGGER.propagate = False
 
 
 class Phases:
