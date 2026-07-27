@@ -126,6 +126,46 @@ def app_with_unresolved():
         mp.undo()
 
 
+@pytest.fixture
+def app_with_two_models():
+    """Plain fixture plus one extra session dated before
+    parse.MODEL_CUTOFF_DT, so it resolves to "kimi-k2-6" instead of the
+    "kimi-k2-7-code" every other fixture session gets. All fixture data
+    is a canonical, exact-rate label — this is the only way to get a
+    genuinely second model into a /api/cache response without patching
+    pricing.MODEL_RATES underneath the ingest itself.
+
+    Function-scoped, like app_with_unresolved, for the same reason: it
+    points DATABASE_URL_VIZ at its own DB.
+    """
+    def _inject_early_model(r2_root: Path):
+        early = r2_root / "kimi/sessions/projA/sess-E/wire.jsonl"
+        early.parent.mkdir(parents=True, exist_ok=True)
+        early.write_text(json.dumps({
+            "timestamp": "2026-06-01T00:00:00Z",
+            "message": {
+                "type": "StatusUpdate",
+                "payload": {
+                    "message_id": "msg-sess-e",
+                    "token_usage": {
+                        "input_other": 40,
+                        "input_cache_creation": 0,
+                        "input_cache_read": 0,
+                        "output": 20,
+                    },
+                },
+            },
+        }) + "\n")
+
+    mp = pytest.MonkeyPatch()
+    try:
+        yield from _build_app(
+            mp, pre_ingest=_inject_early_model, test_db="kimimeter_test_twomodel"
+        )
+    finally:
+        mp.undo()
+
+
 def test_projects(app_with_data):
     r = app_with_data.get("/api/projects")
     assert r.status_code == 200
@@ -203,6 +243,45 @@ def test_cache_session_total_matches_per_model_sum(app_with_data):
     sum_cost = round(sum(m["cost_total"] for m in body["per_model"]), 4)
     assert body["session_total"]["turns"] == sum_turns
     assert body["session_total"]["cost_total"] == sum_cost
+
+
+def test_cache_session_total_estimated_rate_true_when_any_model_estimated(
+    app_with_two_models, monkeypatch
+):
+    """app_with_two_models carries kimi-k2-6 (the injected early session)
+    alongside kimi-k2-7-code (everything else). Both are exact matches
+    normally; drop kimi-k2-6 from the rate table so it resolves as
+    "default" (estimated) while kimi-k2-7-code stays exact — a genuine
+    mixed session.
+    """
+    from backend import pricing
+
+    patched = {k: v for k, v in pricing.MODEL_RATES.items() if k != "kimi-k2-6"}
+    monkeypatch.setattr(pricing, "MODEL_RATES", patched)
+
+    body = app_with_two_models.get("/api/cache?range=3650d").json()
+    assert len(body["per_model"]) >= 2, body["per_model"]
+    flags = {m["model"]: m["estimated_rate"] for m in body["per_model"]}
+    assert flags["kimi-k2-6"] is True
+    assert flags["kimi-k2-7-code"] is False
+    assert body["session_total"]["estimated_rate"] is True
+
+
+def test_cache_session_total_estimated_rate_false_when_all_exact(app_with_two_models):
+    body = app_with_two_models.get("/api/cache?range=3650d").json()
+    assert len(body["per_model"]) >= 2, body["per_model"]
+    assert all(m["estimated_rate"] is False for m in body["per_model"])
+    assert body["session_total"]["estimated_rate"] is False
+
+
+def test_cache_session_total_estimated_rate_false_for_empty_per_model(app_with_data):
+    """An empty per_model list must not crash any(...) over it, and must not
+    default-True a total with no contributing models."""
+    r = app_with_data.get("/api/cache?range=3650d&model=nonexistent-model-zzz")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["per_model"] == []
+    assert body["session_total"]["estimated_rate"] is False
 
 
 def test_transcript_streams(app_with_data):

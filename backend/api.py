@@ -858,6 +858,7 @@ def cache_view(
             k: round(sum(m["cost_buckets"][k] for m in per_model), 4)
             for k in ("fresh", "read", "output")
         },
+        "estimated_rate": any(m["estimated_rate"] for m in per_model),
     }
     total_in = session_total["fresh"] + session_total["cache_read"]
     session_total["hit_rate_pct"] = round(
