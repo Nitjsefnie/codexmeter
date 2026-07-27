@@ -605,6 +605,11 @@ def test_a_malformed_hit_ts_does_not_take_down_the_dashboard(app_with_fresh_data
     `::timestamptz` RAISES on a malformed value, and the traceback escapes
     the handler — so one bad `ts` anywhere in files.rate_limit_hits would
     500 the entire dashboard, every panel, not merely this one.
+
+    The second block below is the one that matters: those values are
+    timestamp-SHAPED and still raise on cast, so a guard that pattern-
+    matches the shape passes them straight through to the cast it was
+    meant to protect. Only real input validation excludes them.
     """
     import psycopg
     from backend import cache
@@ -615,17 +620,25 @@ def test_a_malformed_hit_ts_does_not_take_down_the_dashboard(app_with_fresh_data
             "       rate_limit_hits = %s::jsonb "
             " WHERE file_key = (SELECT MIN(file_key) FROM files WHERE is_main)",
             (json.dumps([
+                # Not timestamp-shaped at all.
                 {"ts": "not-a-timestamp", "content": "junk ts"},
                 {"ts": 123, "content": "numeric ts"},
                 {"ts": "", "content": "empty ts"},
                 {"ts": None, "content": "null ts"},
                 {"content": "no ts key at all"},
+                # Timestamp-shaped, but not valid timestamps.
+                {"ts": "2026-13-45T99:99:99Z", "content": "month 13, day 45"},
+                {"ts": "2026-02-30T00:00:00Z", "content": "30th of february"},
+                {"ts": "2026-01-01 25:00:00Z", "content": "hour 25"},
+                {"ts": "2026-01-01T00:00:00Z lolwat", "content": "trailing junk"},
+                # Valid, and on either side of the range boundary.
                 {"ts": "2026-07-20T10:00:00Z", "content": "good hit"},
+                {"ts": "1998-01-01T00:00:00Z", "content": "too old"},
             ]),),
         )
         conn.commit()
 
     cache.response_cache.clear()
-    r = app_with_fresh_data.get("/api/dashboard?range=3650d")
+    r = app_with_fresh_data.get("/api/dashboard?range=30d")
     assert r.status_code == 200, f"{r.status_code}: {r.text[:300]}"
     assert [h["content"] for h in r.json()["rate_limit_hits"]] == ["good hit"]

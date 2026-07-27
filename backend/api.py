@@ -1361,7 +1361,7 @@ def dashboard(
         rl_args = list(file_args) + [since]
         rl_rows = ph.execute(
             "rate_limits", c,
-            rf"""
+            f"""
             SELECT f.session_id, hit
             FROM files f, jsonb_array_elements(f.rate_limit_hits) AS hit
             WHERE f.r2_last_modified >= %s {proj_filter}
@@ -1371,16 +1371,20 @@ def dashboard(
               -- than `since`, so filter on each hit's own ts too. The
               -- mtime clause stays as the coarse, indexable pre-filter.
               --
-              -- The cast is guarded by a CASE, not by a plain
-              -- `AND regex AND cast`: casting a malformed ts RAISES
+              -- The cast is guarded, because casting a malformed ts RAISES
               -- (`invalid input syntax for type timestamp with time zone`)
-              -- and would take out the WHOLE dashboard, not just this
-              -- panel, and the planner is free to evaluate a bare cast
-              -- before the regex that was meant to protect it. CASE is the
-              -- one form whose evaluation order is guaranteed; a
-              -- non-matching hit yields NULL, which fails the >= and is
-              -- dropped — which is what we want for junk.
-              AND (CASE WHEN hit->>'ts' ~ '^\d{{4}}-\d{{2}}-\d{{2}}[T ]'
+              -- and the traceback would take out the WHOLE dashboard, not
+              -- just this panel. Two halves to the guard:
+              --   * pg_input_is_valid, not a regex — a shape test admits
+              --     '2026-13-45T99:99:99Z' and '2026-02-30T00:00:00Z',
+              --     which look like timestamps and still raise on cast.
+              --     (PG16+; production is 17 and CI runs postgres:16.)
+              --   * CASE, not `AND valid AND cast` — the planner may
+              --     evaluate a bare cast before the test protecting it,
+              --     while CASE's evaluation order is guaranteed.
+              -- A hit that fails the test yields NULL, which fails the >=
+              -- and is dropped, which is what we want for junk.
+              AND (CASE WHEN pg_input_is_valid(hit->>'ts', 'timestamptz')
                         THEN (hit->>'ts')::timestamptz END) >= %s
             """,
             rl_args,
