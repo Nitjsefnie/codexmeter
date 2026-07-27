@@ -149,6 +149,18 @@ def test_cache_per_model_shape(app_with_data):
         assert {"fresh", "read", "output"} == set(m["cost_buckets"])
 
 
+def test_cache_per_model_reports_whether_the_rate_was_matched(app_with_data):
+    """Cost computed from assumed rates must arrive labelled as such, or the
+    UI renders a guess as a billed fact. Every fixture model is a canonical
+    label, so nothing here is estimated; pricing's own tests cover the
+    unmatched side.
+    """
+    body = app_with_data.get("/api/cache?range=3650d").json()
+    assert body["per_model"], "fixture produced no per-model rows"
+    for m in body["per_model"]:
+        assert m["estimated_rate"] is False, m["model"]
+
+
 def test_cache_dedups_cross_file_uuid(app_with_data):
     """sess-C main + subagent peer + sess-D main all have uuid='shared-uuid-1'.
     Records table holds 3 rows for that uuid; DISTINCT ON dedups to 1 in the

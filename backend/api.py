@@ -738,7 +738,7 @@ def cache_view(
     Returns:
       {
         range, project,
-        per_model: [{model, turns, fresh, cache_read, output,
+        per_model: [{model, turns, fresh, cache_read, output, estimated_rate,
                      hit_rate_pct, cost_total, cost_buckets}],
         session_total: {same shape, summed across per_model},
         top_output: [{ts, line, model, output, c_read, fresh, cost, file_key}],
@@ -834,6 +834,7 @@ def cache_view(
             "fresh": fresh,
             "cache_read": cr,
             "output": output,
+            "estimated_rate": pricing.resolve(model).estimated,
             "hit_rate_pct": round((cr / total_in * 100.0) if total_in else 0.0, 1),
             "cost_total": round(float(cost or 0), 4),
             "cost_buckets": {

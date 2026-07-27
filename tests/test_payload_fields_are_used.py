@@ -42,6 +42,9 @@ ALLOWED_UNUSED: dict[str, str] = {
     "range": "echo of the request parameter",
     "project": "echo of the request parameter",
     "tz": "echo of the server-side timezone used for bucketing",
+    # Says the rate behind a cost was assumed, not matched. Rendering it is a
+    # separate change made across kimimeter and claudit together.
+    "estimated_rate": "sent for parity with claudit; UI does not surface it yet",
 }
 
 # Generic names that appear all over the frontend for unrelated reasons,

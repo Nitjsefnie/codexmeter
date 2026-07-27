@@ -40,11 +40,88 @@ def test_unknown_model_falls_back_to_default():
     assert r == pricing.DEFAULT_RATES
 
 
-def test_rate_lookup_is_substring_match():
-    # rate_for iterates MODEL_RATES and returns the first whose key is
-    # contained in the supplied model string.
-    assert pricing.rate_for("x-kimi-k2-7-code-y") == pricing.MODEL_RATES["kimi-k2-7-code"]
-    assert pricing.rate_for("x-kimi-k2-6-y") == pricing.MODEL_RATES["kimi-k2-6"]
+# Every label parse._model_for can emit.
+LIVE_MODELS = ("kimi-k3", "kimi-k2-7-code", "kimi-k2-6")
+
+
+@pytest.mark.parametrize("model", LIVE_MODELS)
+def test_live_model_ids_resolve_exact(model):
+    r = pricing.resolve(model)
+    assert r.kind == "exact"
+    assert r.key == model
+    assert r.estimated is False
+    assert r.rates is pricing.MODEL_RATES[model]
+
+
+def test_every_table_key_resolves_to_itself():
+    """A key whose own shape the matcher rejects would price nothing."""
+    for key in pricing.MODEL_RATES:
+        assert pricing.resolve(key).key == key
+
+
+@pytest.mark.parametrize("model", [
+    "kimi-k2-6-turbo",
+    "kimi-k2-7-code-fast",
+    "kimi-k3-mini",
+    "kimi-k2-60",
+    "x-kimi-k2-7-code-y",
+    "kimi-code/k3",
+])
+def test_an_id_merely_containing_a_table_key_is_not_an_exact_match(model):
+    """Anchored matching, not substring. A model the table has never heard
+    of must not inherit the rates of whatever key sits inside its name.
+    """
+    r = pricing.resolve(model)
+    assert r.kind == "default"
+    assert r.key is None
+    assert r.estimated is True
+
+
+def test_an_unknown_k3_variant_is_not_billed_at_k3_rates():
+    """The substring matcher priced "kimi-k3-mini" at K3's ~3x rates on the
+    strength of a name. Unknown means unknown: default rates, flagged.
+    """
+    assert pricing.rate_for("kimi-k3-mini") != pricing.MODEL_RATES["kimi-k3"]
+    assert pricing.rate_for("kimi-k3-mini") is pricing.DEFAULT_RATES
+
+
+@pytest.mark.parametrize("model", [
+    "kimi-k3-20260601",   # dated snapshot of the same model
+    "kimi-k3[1m]",        # context-window bracket suffix
+    "kimi-k3@latest",     # provider alias suffix
+    "KIMI-K3",            # case
+    "  kimi-k3  ",        # padding
+    "kimi-k2.7-code",     # dotted version separator
+])
+def test_suffixes_that_still_name_a_known_model_resolve_exact(model):
+    assert pricing.resolve(model).kind == "exact"
+
+
+def test_unknown_model_is_flagged_estimated():
+    r = pricing.resolve("not-a-real-model")
+    assert r.kind == "default"
+    assert r.estimated is True
+    assert r.rates is pricing.DEFAULT_RATES
+
+
+def test_empty_model_resolves_to_the_flagged_default():
+    r = pricing.resolve("")
+    assert r.kind == "default"
+    assert r.key is None
+    assert r.estimated is True
+    assert r.rates is pricing.DEFAULT_RATES
+
+
+@pytest.mark.parametrize("model", LIVE_MODELS)
+def test_rate_for_still_returns_the_table_dict_for_live_models(model):
+    assert pricing.rate_for(model) is pricing.MODEL_RATES[model]
+
+
+def test_rate_for_still_defaults_for_empty_missing_and_unknown_ids():
+    # api._per_model passes a model straight off a DB row, which may be NULL.
+    assert pricing.rate_for("") is pricing.DEFAULT_RATES
+    assert pricing.rate_for(None) is pricing.DEFAULT_RATES
+    assert pricing.rate_for("not-a-real-model") is pricing.DEFAULT_RATES
 
 
 def test_k2_7_code_compute_cost_known_vector():

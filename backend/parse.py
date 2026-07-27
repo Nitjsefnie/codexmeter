@@ -55,8 +55,9 @@ def _canonical_model(wire_model: str | None) -> str | None:
     settle it alone (ambiguous id, unrecognized id, or no id at all).
 
     Only canonical labels may reach pricing.compute_cost: pricing.rate_for
-    matches by substring, so a raw "kimi-code/k3" would match no key and
-    silently bill at DEFAULT_RATES (k2-6) — a ~3x undercount.
+    matches keys anchored at the start of the id, so a raw "kimi-code/k3"
+    would match no key and silently bill at DEFAULT_RATES (k2-6) — a ~3x
+    undercount.
     """
     if not wire_model:
         return None
