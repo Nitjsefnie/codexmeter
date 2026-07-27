@@ -48,6 +48,11 @@ BUCKETS = ("fresh", "create", "read", "output")
 # Ids whose outcome the anchoring work turned on. Every one of these merely
 # CONTAINS a table key, so the old substring matcher billed each at that key's
 # rates; all of them must now reach the default on BOTH sides.
+#
+# Each entry names the drift it guards, because none of them looks necessary
+# from the shipped code — today's two halves agree on every id here. They earn
+# their place by failing when one half is perturbed, so pruning an entry that
+# reads as redundant is how the corpus stops covering a drift direction.
 NEAR_MISS_IDS = [
     "kimi-k3-mini",
     "kimi-k2-6-turbo",
@@ -59,6 +64,26 @@ NEAR_MISS_IDS = [
     "gpt-5",
     "",
     None,
+    # --- the snapshot-suffix WIDTH bounds ---
+    # A dated snapshot is 6-8 digits; a short numeric suffix is a different
+    # model. EXACT_SUFFIXES pins 6 and 8 as accepted, and these pin the two
+    # digit counts just outside that range as rejected — without them, a
+    # _SNAPSHOT_SUFFIX relaxed on either bound ({1,8}, {6,9}) reads every
+    # version suffix as a snapshot and bills "kimi-k3-1" at K3's ~3x rates.
+    "kimi-k3-1",              # 1 digit — below the floor
+    "kimi-k2-7-code-8",       # 1 digit, other family
+    "kimi-k3-12345",          # 5 digits — the last width below the floor
+    "kimi-k3-123456789",      # 9 digits — the first width above the ceiling
+    # --- provider/routing prefixes ---
+    # pricing._normalise deliberately does NOT strip a provider prefix (see
+    # its docstring): a raw id that reaches pricing is a bug and must stay
+    # visible as the default, not be quietly repaired. "kimi-code/k3" above
+    # cannot catch a normaliser that started stripping one, because its tail
+    # ("k3") is not a table key and it defaults either way. These have a tail
+    # that IS a table key, so a prefix-stripping normaliser resolves them
+    # exact and overcharges against a backend that defaults them.
+    "moonshot/kimi-k3",
+    "openrouter/kimi-k2-7-code",
 ]
 
 # Suffix forms that still name a known model, applied to every table key so a
