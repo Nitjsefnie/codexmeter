@@ -39,8 +39,8 @@ const WIRE_MODEL_MAP = { "k3": "kimi-k3" };
 
 // Mirrors backend/parse.py _canonical_model. Returns null when the wire cannot
 // settle the model alone. Canonicalising BEFORE any rate lookup is mandatory:
-// rateForModel matches by substring, so a raw "kimi-code/k3" matches no key and
-// silently bills at DEFAULT_RATES (k2-6) — a ~3x undercount.
+// rateForModel anchors at the start of the id, so a raw "kimi-code/k3" matches
+// no key and bills at DEFAULT_RATES (k2-6) — a ~3x undercount.
 function canonicalModel(wireModel) {
   if (!wireModel) return null;
   const tail = String(wireModel).split("/").pop();
@@ -70,18 +70,47 @@ function modelFor(wireModel, ts) {
   return "kimi-k3";
 }
 
-window.rateForModel = function rateForModel(model) {
-  if (!model) return DEFAULT_RATES;
-  for (const key in MODEL_RATES) {
-    if (model.includes(key)) {
-      const r = MODEL_RATES[key];
-      return {
-        fresh: r.fresh, create: r.create, read: r.read, output: r.output,
-        out: r.output, c5: r.create, c1h: 0,
-      };
+// Mirrors backend/pricing.py _normalise: case-fold and normalise version
+// separators, so "Kimi-K2.7-code" and "kimi-k2-7-code" name the same model.
+// Deliberately does NOT strip a provider prefix — a raw wire id that reaches
+// pricing ("kimi-code/k3") is a bug and must keep resolving to the default
+// rather than being quietly repaired here.
+function _normaliseModel(model) {
+  return (model ? String(model) : "").trim().toLowerCase().replace(/\./g, "-");
+}
+
+// Mirrors backend/pricing.py _SNAPSHOT_SUFFIX. A dated snapshot suffix
+// ("-20260601") names the same model at a pinned revision; a version suffix
+// ("-8") or a mode suffix ("-turbo") names a DIFFERENT model, which the table
+// cannot price.
+const _SNAPSHOT_SUFFIX = /^-?\d{6,8}$/;
+
+// Mirrors backend/pricing.py _match_key. ANCHORED at the start, with a
+// remainder of nothing, a bracket, an "@" or a dated snapshot — that is the
+// whole point: an unanchored substring test bills a model the table has never
+// heard of at the rates of whatever key happens to sit inside its name, so
+// "kimi-k3-mini" would take K3's ~3x rates on the strength of its name alone.
+// No key here is a prefix of another, but the table stays most-specific-first
+// so that a future one can be.
+function _matchRateKey(norm) {
+  for (const key of Object.keys(MODEL_RATES)) {
+    if (!norm.startsWith(key)) continue;
+    const rest = norm.slice(key.length);
+    if (rest === "" || rest[0] === "[" || rest[0] === "@"
+        || _SNAPSHOT_SUFFIX.test(rest)) {
+      return key;
     }
   }
-  const r = DEFAULT_RATES;
+  return null;
+}
+
+// Rates for a model id, in the shape the views want: the backend's four
+// buckets plus the claudit-compatible aliases (out/c5/c1h) app.jsx reads.
+// An id the table cannot match is priced at DEFAULT_RATES — the same
+// fall-back backend/pricing.py resolve() reports as kind="default".
+window.rateForModel = function rateForModel(model) {
+  const key = _matchRateKey(_normaliseModel(model));
+  const r = key === null ? DEFAULT_RATES : MODEL_RATES[key];
   return {
     fresh: r.fresh, create: r.create, read: r.read, output: r.output,
     out: r.output, c5: r.create, c1h: 0,
