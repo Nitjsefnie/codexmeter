@@ -1,5 +1,4 @@
 import lzma
-import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -9,8 +8,8 @@ import pytest
 from backend import r2
 
 
-@pytest.fixture
-def mini_r2(monkeypatch):
+@pytest.fixture(name="mini_r2")
+def _mini_r2(monkeypatch):
     tmp = tempfile.mkdtemp(prefix="kd-test-r2-")
     root = Path(tmp) / "kimi"
     (root / "proj-a" / "sess-1").mkdir(parents=True)

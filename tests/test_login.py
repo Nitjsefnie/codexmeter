@@ -1,12 +1,12 @@
-import os
-from unittest.mock import patch
-
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
+from backend import auth
 from backend import login as login_mod
 from backend import session as session_mod
-from backend import auth
+from backend.login import _LOGIN_FAILURES
 
 
 @pytest.fixture(autouse=True)
@@ -15,16 +15,14 @@ def _reset_rate_limits():
     so test_session_cookie_round_trip doesn't inherit failures from
     test_rate_limit_after_5_failures (both POST from the same TestClient host).
     """
-    login_mod._LOGIN_FAILURES.clear()
+    _LOGIN_FAILURES.clear()
     yield
-    login_mod._LOGIN_FAILURES.clear()
+    _LOGIN_FAILURES.clear()
 
 
-@pytest.fixture
-def app(monkeypatch):
+@pytest.fixture(name="app")
+def _app(monkeypatch):
     """Build a fresh FastAPI app per test, with the auth DB mocked."""
-    from fastapi import FastAPI
-    from starlette.requests import Request
     a = FastAPI()
     a.middleware("http")(session_mod.auth_middleware)
     a.include_router(login_mod.router)
@@ -36,8 +34,8 @@ def app(monkeypatch):
     return a
 
 
-@pytest.fixture
-def fake_user(monkeypatch):
+@pytest.fixture(name="fake_user")
+def _fake_user(monkeypatch):
     """Stub the auth DB with one user that has a known password."""
     config: dict = {}
     auth.set_web_password(config, "hunter2")

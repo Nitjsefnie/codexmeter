@@ -128,14 +128,15 @@ def _node_probe():
       }}));
     """
     proc = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=60
+        ["node", "-e", script], capture_output=True, text=True, timeout=60,
+        check=False,  # the assert below reports stderr on failure
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout)
 
 
-@pytest.fixture(scope="module")
-def js():
+@pytest.fixture(scope="module", name="js")
+def _js():
     return _node_probe()
 
 

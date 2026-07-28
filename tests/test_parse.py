@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from backend import parse, pricing
+from backend.parse import _canonical_model, _model_for
 
 
 FIX = Path(__file__).resolve().parents[1] / "fixtures" / "parser"
@@ -148,15 +149,15 @@ def test_post_k3_cutoff_cost_uses_k3_rates():
 
 
 def test_canonical_model_maps_k3_provider_id():
-    assert parse._canonical_model("kimi-code/k3") == "kimi-k3"
+    assert _canonical_model("kimi-code/k3") == "kimi-k3"
 
 
 def test_canonical_model_returns_none_for_ambiguous_and_unknown():
     # kimi-for-coding spans both k2.6 and k2.7-code: the wire cannot resolve it.
-    assert parse._canonical_model("kimi-code/kimi-for-coding") is None
-    assert parse._canonical_model("some/unknown-model") is None
-    assert parse._canonical_model(None) is None
-    assert parse._canonical_model("") is None
+    assert _canonical_model("kimi-code/kimi-for-coding") is None
+    assert _canonical_model("some/unknown-model") is None
+    assert _canonical_model(None) is None
+    assert _canonical_model("") is None
 
 
 def test_model_for_k3_wire_string_beats_an_earlier_date():
@@ -164,7 +165,7 @@ def test_model_for_k3_wire_string_beats_an_earlier_date():
     predate the constant by ~20 minutes.
     """
     ts = datetime.fromtimestamp(parse.K3_CUTOFF_EPOCH - 3600, tz=timezone.utc)
-    assert parse._model_for("kimi-code/k3", ts) == "kimi-k3"
+    assert _model_for("kimi-code/k3", ts) == "kimi-k3"
 
 
 def test_model_for_kimi_for_coding_never_becomes_k3():
@@ -172,7 +173,7 @@ def test_model_for_kimi_for_coding_never_becomes_k3():
     A wire that says kimi-for-coding is not k3, whatever the date.
     """
     ts = datetime.fromtimestamp(parse.K3_CUTOFF_EPOCH + 86400, tz=timezone.utc)
-    assert parse._model_for("kimi-code/kimi-for-coding", ts) == "kimi-k2-7-code"
+    assert _model_for("kimi-code/kimi-for-coding", ts) == "kimi-k2-7-code"
 
 
 def test_model_for_unrecognized_wire_id_is_never_promoted_to_k3():
@@ -181,15 +182,15 @@ def test_model_for_unrecognized_wire_id_is_never_promoted_to_k3():
     k2-7-code undercount beats a wrong k3 overcount at ~3x.
     """
     ts = datetime.fromtimestamp(parse.K3_CUTOFF_EPOCH + 86400, tz=timezone.utc)
-    assert parse._model_for("kimi-code/k4-future", ts) == "kimi-k2-7-code"
-    assert parse._model_for("garbage", ts) == "kimi-k2-7-code"
+    assert _model_for("kimi-code/k4-future", ts) == "kimi-k2-7-code"
+    assert _model_for("garbage", ts) == "kimi-k2-7-code"
 
 
 def test_model_for_kimi_for_coding_uses_model_cutoff_for_the_k2_era():
     before = datetime.fromtimestamp(parse.MODEL_CUTOFF_EPOCH - 1, tz=timezone.utc)
     at = datetime.fromtimestamp(parse.MODEL_CUTOFF_EPOCH, tz=timezone.utc)
-    assert parse._model_for("kimi-code/kimi-for-coding", before) == "kimi-k2-6"
-    assert parse._model_for("kimi-code/kimi-for-coding", at) == "kimi-k2-7-code"
+    assert _model_for("kimi-code/kimi-for-coding", before) == "kimi-k2-6"
+    assert _model_for("kimi-code/kimi-for-coding", at) == "kimi-k2-7-code"
 
 
 def test_model_for_without_wire_string_uses_the_full_date_ladder():
@@ -197,14 +198,14 @@ def test_model_for_without_wire_string_uses_the_full_date_ladder():
     k26 = datetime.fromtimestamp(parse.MODEL_CUTOFF_EPOCH - 1, tz=timezone.utc)
     k27 = datetime.fromtimestamp(parse.K3_CUTOFF_EPOCH - 1, tz=timezone.utc)
     k3 = datetime.fromtimestamp(parse.K3_CUTOFF_EPOCH, tz=timezone.utc)
-    assert parse._model_for(None, k26) == "kimi-k2-6"
-    assert parse._model_for(None, k27) == "kimi-k2-7-code"
-    assert parse._model_for(None, k3) == "kimi-k3"
+    assert _model_for(None, k26) == "kimi-k2-6"
+    assert _model_for(None, k27) == "kimi-k2-7-code"
+    assert _model_for(None, k3) == "kimi-k3"
 
 
 def test_model_for_without_timestamp_falls_back_to_k2_7_code():
-    assert parse._model_for(None, None) == "kimi-k2-7-code"
-    assert parse._model_for("kimi-code/kimi-for-coding", None) == "kimi-k2-7-code"
+    assert _model_for(None, None) == "kimi-k2-7-code"
+    assert _model_for("kimi-code/kimi-for-coding", None) == "kimi-k2-7-code"
 
 
 def test_k3_cutoff_matches_earliest_observed_k3_record():

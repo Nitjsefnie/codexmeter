@@ -31,16 +31,16 @@ def test_cache_response_decorator_caches_and_bypasses():
     calls = []
 
     @cache_response
-    def endpoint(range: str = "30d", fresh: int = 0) -> dict:
-        calls.append(range)
-        return {"range": range, "n": len(calls)}
+    def endpoint(range_: str = "30d", fresh: int = 0) -> dict:
+        calls.append(range_)
+        return {"range": range_, "n": len(calls)}
 
-    first = endpoint(range="30d", fresh=0)
-    second = endpoint(range="30d", fresh=0)
+    first = endpoint(range_="30d", fresh=0)
+    second = endpoint(range_="30d", fresh=0)
     assert first == second                    # served from cache
     assert len(calls) == 1                    # body ran once
 
-    bypass = endpoint(range="30d", fresh=1)
+    bypass = endpoint(range_="30d", fresh=1)
     assert len(calls) == 2                    # fresh=1 skips the cache
     assert bypass["n"] == 2
 
@@ -51,23 +51,23 @@ def test_invalidate_serves_stale_then_refreshes():
     calls = []
 
     @cache_response
-    def endpoint(range: str = "30d", fresh: int = 0) -> dict:
-        calls.append(range)
+    def endpoint(range_: str = "30d", fresh: int = 0) -> dict:
+        calls.append(range_)
         return {"n": len(calls)}
 
-    assert endpoint(range="30d", fresh=0) == {"n": 1}
+    assert endpoint(range_="30d", fresh=0) == {"n": 1}
 
     cache_mod.response_cache.invalidate()
 
     # The stale value comes back straight away — NOT a recomputed one.
-    assert endpoint(range="30d", fresh=0) == {"n": 1}
+    assert endpoint(range_="30d", fresh=0) == {"n": 1}
 
     # ...and the refresh lands in the background.
     deadline = time.time() + 5
     while time.time() < deadline and len(calls) < 2:
         time.sleep(0.02)
     assert len(calls) == 2, "background refresh never ran"
-    assert endpoint(range="30d", fresh=0) == {"n": 2}
+    assert endpoint(range_="30d", fresh=0) == {"n": 2}
 
 
 def test_invalidate_keeps_entries_servable():

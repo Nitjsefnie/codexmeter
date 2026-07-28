@@ -30,8 +30,11 @@ from pathlib import Path
 import pytest
 
 # Reuses the API suite's fresh-DB + mini-R2 fixture rather than standing
-# up a second one; importing it is what registers it here.
-from test_api import app_with_data  # noqa: F401
+# up a second one. pytest_plugins registers test_api's fixtures (among
+# them app_with_data) for this module's tests — an import would work too,
+# but the bound name is never referenced in code and the test parameter
+# below would shadow it (W0611/W0621).
+pytest_plugins = ["test_api"]
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 

@@ -4,6 +4,11 @@ from pathlib import Path
 
 import pytest
 
+# Imported at module top like the linters want. The env claims below must
+# only precede imports of backend modules that READ env at import time
+# (backend.app loads .env); backend.cache reads none, so it is safe here.
+from backend import cache
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # ...and this directory, so one test module can import another's fixture
 # instead of duplicating an expensive fresh-DB + mini-R2 setup.
@@ -42,7 +47,6 @@ os.environ["KIMIMETER_WARM_CACHE"] = "0"
 def _reset_response_cache():
     # response_cache is a process-global. Two tests with different fixtures
     # but identical query params would otherwise read each other's payloads.
-    from backend import cache
     cache.response_cache.clear()
     yield
     cache.response_cache.clear()

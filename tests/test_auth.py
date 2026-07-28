@@ -4,14 +4,15 @@ match the upstream user-management process so a hash written there
 verifies here byte-for-byte.
 """
 from backend import auth
+from backend.auth import _pbkdf2
 
 
 def test_pbkdf2_known_vector():
     salt = "00112233445566778899aabbccddeeff"
     pw = "correct horse battery staple"
-    digest = auth._pbkdf2(pw, salt)
+    digest = _pbkdf2(pw, salt)
     assert isinstance(digest, str) and len(digest) == 64
-    assert auth._pbkdf2(pw, salt) == digest
+    assert _pbkdf2(pw, salt) == digest
 
 
 def test_set_then_verify_roundtrip():
