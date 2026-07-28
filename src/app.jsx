@@ -338,7 +338,7 @@ function App() {
           Dashboard hosts four self-fetching panels whose requests must go
           out in parallel with /api/dashboard. It renders a loading summary
           until `synth` arrives. */}
-      {route === 'dashboard' && (dashData || backendOn) && <Dashboard synth={dashData} models={models} backendOn={backendOn} activeProject={activeProject} activeRange={activeRange} dashNonce={dashNonce} />}
+      {route === 'dashboard' && (dashData || backendOn) && <Dashboard synth={dashData} models={models} backendOn={backendOn} activeProject={activeProject} activeRange={activeRange} dashNonce={dashNonce} projects={projects} />}
       {route === 'sessions' && dashData && (
         <SessionsList
           synth={dashData}
@@ -675,7 +675,16 @@ function TokenBreakdownPanel({ events }) {
   );
 }
 
-function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashNonce }) {
+// Label for a Cost-by-Project bar: the picker's display_name when the
+// project is in the projects list (the full, unpaginated list from
+// /api/projects), else the raw id — which covers the synthetic
+// "Other (N projects)" / "unknown" rows and any rollup row the projects
+// endpoint didn't return (e.g. one it renames to '<unresolved>').
+function projectDisplayLabel(projectId, nameByProject) {
+  return (nameByProject && nameByProject[projectId]) || projectId;
+}
+
+function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashNonce, projects }) {
   // `synth` is null until /api/dashboard lands. Render anyway: the four
   // backend panels below (Tool Usage, Reply Latency, Tool Error Rate,
   // Activity Heatmap) each fetch their OWN endpoint on mount, and gating
@@ -736,8 +745,16 @@ function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashN
   // desc, dropped zero-cost rows, and folded the tail into "Other (N
   // projects)". Guests get no cost_by_project key at all (server-side),
   // so the empty list hides the panel for them without an isGuest check.
+  // Labels join cost_by_project.project (= usage_rollup.project_id, the
+  // same key the picker's /api/projects rows carry as project_id) to the
+  // picker's display_name, falling back to the raw id on a miss.
+  const nameByProject = useMemo(() => {
+    const m = {};
+    for (const p of projects || []) m[p.project_id] = p.display_name;
+    return m;
+  }, [projects]);
   const costByProject = backendByProject
-    .map(r => ({ label: r.project, value: r.cost_usd, color: window.dashboardCol.costUSD }));
+    .map(r => ({ label: projectDisplayLabel(r.project, nameByProject), value: r.cost_usd, color: window.dashboardCol.costUSD }));
 
   const totalCostStr = window.humanFmt(totals.cost, true);
 
