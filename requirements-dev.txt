@@ -8,3 +8,8 @@ isort==8.0.1
 pycodestyle==2.14.0
 pylint==4.0.6
 pyright==1.1.408
+# Not a tool: the types gate installs this file so pyright can resolve
+# third-party imports, and scripts/plots/ccusage_*.py imports matplotlib.
+# It is an analyst-side plotting dependency, not a backend runtime dep,
+# so it does not belong in backend/requirements.txt.
+matplotlib==3.10.8
