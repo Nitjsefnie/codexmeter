@@ -1,5 +1,12 @@
 [MASTER]
 
+# orjson is a C extension. Without this, pylint refuses to load it for
+# introspection and reports every orjson.loads / orjson.JSONDecodeError as
+# no-member — a false positive, both attributes exist. Allowing the load
+# makes the check MORE accurate, not less: pylint verifies the real module
+# instead of guessing. Nothing here disables or skips any message.
+extension-pkg-allow-list=orjson
+
 [MESSAGES CONTROL]
 disable=
     line-too-long,

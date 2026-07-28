@@ -7,7 +7,8 @@ S3-compatible endpoint.
 API surface:
 - list_keys(prefix='') -> iterator of R2Object
 - get_object(key) -> bytes
-- get_stream(key) -> file-like (for line-streaming large transcripts)
+- get_stream(key) -> context manager yielding a file-like (for
+  line-streaming large transcripts)
 """
 from __future__ import annotations
 
@@ -15,10 +16,13 @@ import hashlib
 import lzma
 import os
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Iterator, NamedTuple
 from urllib.parse import urlparse
+
+import boto3
+from botocore.config import Config
 
 
 class R2Object(NamedTuple):
@@ -50,57 +54,67 @@ def _safe_join(root: str, key: str) -> str:
     return full
 
 
+def _scan_root(root: str, bucket: str) -> str:
+    """Bucket directory inside a file:// mirror root (or root itself when
+    the mirror has no bucket level)."""
+    return os.path.join(root, bucket) if os.path.isdir(
+        os.path.join(root, bucket)
+    ) else root
+
+
+def _list_keys_file(root: str, bucket: str, prefix: str) -> Iterator[R2Object]:
+    scan_root = _scan_root(root, bucket)
+    prefix_path = _safe_join(scan_root, prefix) if prefix else scan_root
+    if not os.path.isdir(prefix_path):
+        return
+    for dp, _dirs, fns in os.walk(prefix_path, followlinks=True):
+        for fn in fns:
+            full = os.path.join(dp, fn)
+            rel = os.path.relpath(full, scan_root).replace(os.sep, "/")
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            etag = hashlib.sha1(
+                f"{int(st.st_mtime_ns)}:{st.st_size}".encode()
+            ).hexdigest()
+            yield R2Object(
+                key=rel,
+                etag=etag,
+                size=st.st_size,
+                last_modified=datetime.fromtimestamp(
+                    st.st_mtime, tz=timezone.utc
+                ),
+            )
+
+
+def _list_keys_s3(bucket: str, prefix: str) -> Iterator[R2Object]:
+    s3 = _boto_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for o in page.get("Contents", []):
+            yield R2Object(
+                key=o["Key"],
+                etag=str(o["ETag"]).strip('"'),
+                size=int(o["Size"]),
+                last_modified=o["LastModified"],
+            )
+
+
 def list_keys(prefix: str = "") -> Iterator[R2Object]:
     file_mode, root = _is_file_mode()
     bucket = os.environ.get("R2_BUCKET", "kimi")
     if file_mode:
-        bucket_root = os.path.join(root, bucket) if os.path.isdir(
-            os.path.join(root, bucket)
-        ) else root
-        scan_root = bucket_root
-        prefix_path = _safe_join(scan_root, prefix) if prefix else scan_root
-        if not os.path.isdir(prefix_path):
-            return
-        for dp, _dirs, fns in os.walk(prefix_path, followlinks=True):
-            for fn in fns:
-                full = os.path.join(dp, fn)
-                rel = os.path.relpath(full, scan_root).replace(os.sep, "/")
-                try:
-                    st = os.stat(full)
-                except OSError:
-                    continue
-                etag = hashlib.sha1(
-                    f"{int(st.st_mtime_ns)}:{st.st_size}".encode()
-                ).hexdigest()
-                yield R2Object(
-                    key=rel,
-                    etag=etag,
-                    size=st.st_size,
-                    last_modified=datetime.fromtimestamp(
-                        st.st_mtime, tz=timezone.utc
-                    ),
-                )
+        yield from _list_keys_file(root, bucket, prefix)
     else:
-        s3 = _boto_client()
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for o in page.get("Contents", []):
-                yield R2Object(
-                    key=o["Key"],
-                    etag=str(o["ETag"]).strip('"'),
-                    size=int(o["Size"]),
-                    last_modified=o["LastModified"],
-                )
+        yield from _list_keys_s3(bucket, prefix)
 
 
 def get_object(key: str) -> bytes:
     file_mode, root = _is_file_mode()
     bucket = os.environ.get("R2_BUCKET", "kimi")
     if file_mode:
-        scan_root = os.path.join(root, bucket) if os.path.isdir(
-            os.path.join(root, bucket)
-        ) else root
-        full = _safe_join(scan_root, key)
+        full = _safe_join(_scan_root(root, bucket), key)
         with open(full, "rb") as f:
             data = f.read()
     else:
@@ -113,25 +127,22 @@ def get_object(key: str) -> bytes:
     return data
 
 
+@contextmanager
 def get_stream(key: str):
-    """Open a streaming reader. Caller is responsible for closing it.
+    """Yield a streaming reader, closed when the with-block exits.
 
-    For `.xz` keys the returned stream transparently inflates xz on read.
+    For `.xz` keys the yielded stream transparently inflates xz on read.
     """
     file_mode, root = _is_file_mode()
     bucket = os.environ.get("R2_BUCKET", "kimi")
     if file_mode:
-        scan_root = os.path.join(root, bucket) if os.path.isdir(
-            os.path.join(root, bucket)
-        ) else root
-        full = _safe_join(scan_root, key)
-        raw = open(full, "rb")
+        full = _safe_join(_scan_root(root, bucket), key)
+        with open(full, "rb") as raw:
+            yield lzma.LZMAFile(raw) if key.endswith(".xz") else raw
     else:
         s3 = _boto_client()
         raw = s3.get_object(Bucket=bucket, Key=key)["Body"]
-    if key.endswith(".xz"):
-        return lzma.LZMAFile(raw)
-    return raw
+        yield lzma.LZMAFile(raw) if key.endswith(".xz") else raw
 
 
 _tls = threading.local()
@@ -150,8 +161,6 @@ def _boto_client():
     client = getattr(_tls, "client", None)
     if client is not None:
         return client
-    import boto3
-    from botocore.config import Config
 
     endpoint = os.environ["R2_ENDPOINT"]
     client = boto3.client(
