@@ -85,6 +85,7 @@
         "_parseKimiCode": "readonly",
         "_parseLegacy": "readonly",
         "_toolColor": "readonly",
+        "asUsageRecord": "readonly",
         "axisLabelDepthPx": "readonly",
         "axisLabelMaxChars": "readonly",
         "backendDashToShape": "readonly",
@@ -94,6 +95,7 @@
         "capForModel": "readonly",
         "computeCache": "readonly",
         "computeContextGrowth": "readonly",
+        "computeSessionStats": "readonly",
         "computeSessions": "readonly",
         "computeStats": "readonly",
         "computeTokenBreakdown": "readonly",
@@ -124,6 +126,7 @@
         "toolGlyph": "readonly",
         "tsToEpoch": "readonly",
         "txToDashData": "readonly",
+        "usageCtxInput": "readonly",
         "vbarPadB": "readonly",
         "wrapAxisLabel": "readonly"
     },
