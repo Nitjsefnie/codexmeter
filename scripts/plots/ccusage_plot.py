@@ -36,6 +36,7 @@ from ccusage_common import (
     TEXT,
     TEXT_DIM,
     TZ_ALIASES,
+    _git_has_local_changes,
     apply_theme,
     human_format,
     make_formatter,
@@ -781,6 +782,18 @@ def _resolve_script_path():
     return candidate
 
 
+def _refuse_overwrite(script_path, reason):
+    """Fail closed: never clobber a file whose provenance we cannot verify."""
+    print(
+        f"Error: refusing to overwrite {script_path}: {reason}\n"
+        "This copy lives in a git repo alongside ccusage_common.py and\n"
+        "ccusage_burn.py; the upstream single-file release would silently\n"
+        "undo the split. Update via git instead (git pull).",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def check_update(target_path=None):
     """Check for a newer version and auto-update if available."""
     script_path = Path(target_path).resolve() if target_path else _resolve_script_path()
@@ -794,6 +807,21 @@ def check_update(target_path=None):
         sys.exit(1)
 
     print(f"Script location: {script_path}", file=sys.stderr)
+
+    # Guard (issue #19): this file is tracked in git and was split into
+    # ccusage_common.py / ccusage_burn.py / ccusage_plot.py. Overwriting a
+    # locally modified copy with the upstream single-file release would
+    # silently restore the unsplit version and orphan the siblings. When
+    # git cannot vouch for the file, fail closed rather than risk it.
+    modified = _git_has_local_changes(script_path)
+    if modified is None:
+        _refuse_overwrite(
+            script_path,
+            "cannot verify its git state (git missing, not a work tree, "
+            "or file not tracked)",
+        )
+    if modified:
+        _refuse_overwrite(script_path, "it has uncommitted modifications")
 
     try:
         with urllib.request.urlopen(SCRIPT_URL, timeout=10) as resp:

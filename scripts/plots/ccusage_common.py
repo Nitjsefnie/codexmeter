@@ -9,6 +9,9 @@ import. Plain sibling imports keep the main script directly executable
 from datetime import datetime, timezone
 from pathlib import Path
 
+import shutil
+import subprocess
+
 import matplotlib.pyplot as plt
 from matplotlib import ticker
 
@@ -154,3 +157,37 @@ def parse_event_ts(ts_raw):
     if isinstance(ts_raw, (int, float)):
         return datetime.fromtimestamp(ts_raw / 1000, tz=timezone.utc)
     return datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+
+
+def _git_has_local_changes(script_path):
+    """Ask git whether `script_path` is a tracked file with uncommitted changes.
+
+    Returns True/False only when git can actually answer; returns None when
+    it cannot — no git binary, not a work tree, the file is not tracked, or
+    any git error. Callers must treat None as fail-closed.
+    """
+    git = shutil.which("git")
+    if git is None:
+        return None
+
+    def _run(*args):
+        return subprocess.run(
+            [git, "-C", str(script_path.parent), *args],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+
+    try:
+        inside = _run("rev-parse", "--is-inside-work-tree")
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return None
+        # An untracked file has no committed state to compare against.
+        tracked = _run("ls-files", "--error-unmatch", "--", script_path.name)
+        if tracked.returncode != 0:
+            return None
+        # Non-empty porcelain status: staged, modified, or otherwise dirty.
+        status = _run("status", "--porcelain", "--", script_path.name)
+        if status.returncode != 0:
+            return None
+        return bool(status.stdout.strip())
+    except Exception:
+        return None
