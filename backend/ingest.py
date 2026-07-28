@@ -23,10 +23,11 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from backend import cache, db, events, parse, r2
+from backend import api, cache, db, events, parse, r2
 
 log = logging.getLogger("kimimeter.ingest")
 
@@ -68,177 +69,236 @@ FETCH_ATTEMPTS = len(FETCH_BACKOFF_S) + 1
 FAILURE_KEYS_IN_SUMMARY = 5
 
 
-def run_ingest(trigger: str) -> dict:
-    started = datetime.now(timezone.utc)
-    parser_version = os.environ.get("PARSER_VERSION", "1")
-
+def _begin_run(started: datetime, trigger: str) -> int:
+    """Book the ingest_runs row and return its id."""
     with db.viz_conn() as c, c.cursor() as cur:
         cur.execute(
             "INSERT INTO ingest_runs (started_at, trigger) VALUES (%s, %s) "
             "RETURNING id",
             (started, trigger),
         )
-        run_id = cur.fetchone()[0]
+        row = cur.fetchone()
+        if row is None:
+            # INSERT ... RETURNING always yields a row; a None here means
+            # the driver misbehaved, and continuing would mislabel the run.
+            raise RuntimeError("ingest_runs insert returned no id")
+        run_id = int(row[0])
         c.commit()
+    return run_id
 
+
+def _existing_files() -> dict:
+    """file_key -> (etag, parser_version) for reparse decisions."""
+    with db.viz_conn() as c:
+        return {
+            row[0]: (row[1], row[2])
+            for row in c.execute(
+                "SELECT file_key, r2_etag, parser_version FROM files"
+            ).fetchall()
+        }
+
+
+def _scan_r2() -> tuple[list, list[tuple[str, str]]]:
+    """Walk R2 once: (wire.jsonl objects, project.json marker items).
+
+    The marker is published by archive_sessions.py on the originating box
+    and carries the path the session was run from — we use it as the
+    project's display_name.
+    """
+    wire_objs: list = []
+    marker_items: list[tuple[str, str]] = []
+    for obj in r2.list_keys():
+        parts = obj.key.split("/")
+        if len(parts) >= 4 and parts[0] == "sessions" \
+                and parts[-1] in ("wire.jsonl", "wire.jsonl.xz"):
+            wire_objs.append(obj)
+        elif len(parts) == 3 and parts[0] == "sessions" \
+                and parts[2] == "project.json":
+            marker_items.append((parts[1], obj.key))
+    return wire_objs, marker_items
+
+
+def _resolve_project_paths(marker_items: list[tuple[str, str]],
+                           workers: int, failed: list[tuple[str, str]]
+                           ) -> dict[str, str]:
+    """Fetch marker bodies on the pool; project_paths must be fully
+    populated before the wire-object loop starts."""
+    project_paths: dict[str, str] = {}
+    if marker_items:
+        # A marker GET is as droppable as a wire GET — and failing one
+        # used to abort the run even earlier, before r2_listed had been
+        # counted. Same collector, same `failed` list, one summary.
+        for item, res, exc in _resolve(
+            marker_items, lambda it: _fetch_marker(*it), workers
+        ):
+            if exc is not None:
+                _record_failure(failed, item[1], exc)
+                continue
+            if res is not None:
+                project_paths[res[0]] = res[1]
+    return project_paths
+
+
+class _Plan(NamedTuple):
+    """What one R2 scan says needs doing."""
+    listed: int
+    seen_keys: set[str]
+    seen_projects: dict[str, dict]
+    # (obj, proj, project_id, session_id, is_main, stored) per file
+    # needing work; fetched+parsed on a pool.
+    todo: list[tuple]
+
+
+def _update_seen_project(seen_projects: dict[str, dict],
+                         project_paths: dict[str, str],
+                         project_id: str, last_modified) -> dict:
+    proj = seen_projects.setdefault(project_id, {
+        "project_id": project_id,
+        "display_name": project_paths.get(project_id, project_id),
+        "first_seen_at": last_modified,
+        "last_seen_at": last_modified,
+    })
+    if last_modified < proj["first_seen_at"]:
+        proj["first_seen_at"] = last_modified
+    if last_modified > proj["last_seen_at"]:
+        proj["last_seen_at"] = last_modified
+    return proj
+
+
+def _plan_work(wire_objs: list, project_paths: dict[str, str],
+               existing: dict, parser_version: str) -> _Plan:
     listed = 0
+    seen_keys: set[str] = set()
+    seen_projects: dict[str, dict] = {}
+    todo: list[tuple] = []
+    for obj in wire_objs:
+        parts = obj.key.split("/")
+        project_id = parts[1]
+        session_id = parts[2]
+        # Subagent transcripts live at .../subagents/<sub-id>/wire.jsonl;
+        # main session transcripts at .../<uuid>/wire.jsonl. Both get
+        # ingested, but the classification drives the main/subagent
+        # split surfaced by /api/dashboard.
+        is_main = "/subagents/" not in obj.key
+        listed += 1
+        seen_keys.add(obj.key)
+
+        proj = _update_seen_project(
+            seen_projects, project_paths, project_id, obj.last_modified
+        )
+
+        stored = existing.get(obj.key)
+        if (stored is not None and stored[0] == obj.etag
+                and stored[1] == parser_version):
+            continue
+        todo.append((obj, proj, project_id, session_id, is_main, stored))
+    return _Plan(listed, seen_keys, seen_projects, todo)
+
+
+def _persist_one(item: tuple, parsed: dict | None, exc: BaseException | None,
+                 failed: list[tuple[str, str]], parser_version: str
+                 ) -> str | None:
+    """Persist one fetched+parsed file; book the failure instead when the
+    fetch raised. Returns "inserted"/"reparsed"/None for the counters."""
+    obj, proj, project_id, session_id, is_main, stored = item
+    if exc is not None:
+        _record_failure(failed, obj.key, exc)
+        return None
+    _persist(
+        obj, proj, project_id, session_id, is_main, parsed, parser_version,
+    )
+    return "inserted" if stored is None else "reparsed"
+
+
+def _fetch_and_persist(todo: list[tuple], workers: int, parser_version: str,
+                       failed: list[tuple[str, str]]) -> tuple[int, int]:
+    """Fetch + parse is ~88% of per-file wall time and is network-bound
+    (one R2 GET each), so it runs on a thread pool. Persistence stays
+    on this thread: the per-file transaction boundary, and therefore
+    ordering and failure semantics, are exactly as before. Work is
+    submitted in bounded chunks so an 8k-file reparse does not hold
+    every inflated blob in memory at once."""
     inserted = 0
     reparsed = 0
-    deleted = 0
-    # Per-object failures (key, message). Recorded in the run's `error`, but
-    # deliberately NOT used to gate anything: one dropped connection out of
-    # 1,464 files is a run with a retry pending, not a failed run.
-    failed: list[tuple[str, str]] = []
-    # A whole-run exception, which DOES gate the post-passes below.
-    fatal = None
+    chunk = max(1, workers * 4)
+    for start in range(0, len(todo), chunk):
+        batch = todo[start:start + chunk]
+        for item, parsed, exc in _resolve(
+            batch, lambda it: _fetch_and_parse(it[0].key), workers
+        ):
+            outcome = _persist_one(item, parsed, exc, failed, parser_version)
+            if outcome == "inserted":
+                inserted += 1
+            elif outcome == "reparsed":
+                reparsed += 1
+    return inserted, reparsed
 
-    try:
-        # Cache existing file_key → (etag, parser_version) for reparse decisions
-        with db.viz_conn() as c:
-            existing = {
-                row[0]: (row[1], row[2])
-                for row in c.execute(
-                    "SELECT file_key, r2_etag, parser_version FROM files"
-                ).fetchall()
-            }
 
-        # Pre-walk R2 once to (a) collect wire.jsonl keys and (b) discover
-        # sessions/<HASH>/project.json markers. The marker is published by
-        # archive_sessions.py on the originating box and carries the path
-        # the session was run from — we use it as the project's display_name.
-        wire_objs: list = []
-        marker_items: list[tuple[str, str]] = []
-        for obj in r2.list_keys():
-            parts = obj.key.split("/")
-            if len(parts) >= 4 and parts[0] == "sessions" \
-                    and parts[-1] in ("wire.jsonl", "wire.jsonl.xz"):
-                wire_objs.append(obj)
-            elif len(parts) == 3 and parts[0] == "sessions" \
-                    and parts[2] == "project.json":
-                marker_items.append((parts[1], obj.key))
-
-        workers = _worker_count()
-
-        # Fetch marker bodies on the pool; project_paths must be fully
-        # populated before the wire-object loop starts.
-        project_paths: dict[str, str] = {}
-        if marker_items:
-            # A marker GET is as droppable as a wire GET — and failing one
-            # used to abort the run even earlier, before r2_listed had been
-            # counted. Same collector, same `failed` list, one summary.
-            for item, res, exc in _resolve(
-                marker_items, lambda it: _fetch_marker(*it), workers
-            ):
-                if exc is not None:
-                    _record_failure(failed, item[1], exc)
-                    continue
-                if res is not None:
-                    project_paths[res[0]] = res[1]
-
-        seen_keys: set[str] = set()
-        seen_projects: dict[str, dict] = {}
-        # (obj, proj, project_id, session_id, is_main, stored) per file
-        # needing work; fetched+parsed below on a pool.
-        todo: list[tuple] = []
-
-        for obj in wire_objs:
-            parts = obj.key.split("/")
-            project_id = parts[1]
-            session_id = parts[2]
-            # Subagent transcripts live at .../subagents/<sub-id>/wire.jsonl;
-            # main session transcripts at .../<uuid>/wire.jsonl. Both get
-            # ingested, but the classification drives the main/subagent
-            # split surfaced by /api/dashboard.
-            is_main = "/subagents/" not in obj.key
-            listed += 1
-            seen_keys.add(obj.key)
-
-            proj = seen_projects.setdefault(project_id, {
-                "project_id": project_id,
-                "display_name": project_paths.get(project_id, project_id),
-                "first_seen_at": obj.last_modified,
-                "last_seen_at": obj.last_modified,
-            })
-            if obj.last_modified < proj["first_seen_at"]:
-                proj["first_seen_at"] = obj.last_modified
-            if obj.last_modified > proj["last_seen_at"]:
-                proj["last_seen_at"] = obj.last_modified
-
-            stored = existing.get(obj.key)
-            need_reparse = (
-                stored is None
-                or stored[0] != obj.etag
-                or stored[1] != parser_version
-            )
-            if not need_reparse:
-                continue
-
-            todo.append((obj, proj, project_id, session_id, is_main, stored))
-
-        # Fetch + parse is ~88% of per-file wall time and is network-bound
-        # (one R2 GET each), so it runs on a thread pool. Persistence stays
-        # on this thread: the per-file transaction boundary, and therefore
-        # ordering and failure semantics, are exactly as before. Work is
-        # submitted in bounded chunks so an 8k-file reparse does not hold
-        # every inflated blob in memory at once.
-        chunk = max(1, workers * 4)
-        for start in range(0, len(todo), chunk):
-            batch = todo[start:start + chunk]
-            for item, parsed, exc in _resolve(
-                batch, lambda it: _fetch_and_parse(it[0].key), workers
-            ):
-                obj, proj, project_id, session_id, is_main, stored = item
-                if exc is not None:
-                    _record_failure(failed, obj.key, exc)
-                    continue
-                _persist(
-                    obj, proj, project_id, session_id, is_main,
-                    parsed, parser_version,
-                )
-                if stored is None:
-                    inserted += 1
-                else:
-                    reparsed += 1
-
-        # Unconditional project upsert — even when no files needed reparse,
-        # the project marker's path may have changed (e.g. user renamed a
-        # work_dir), and the per-file inner block above runs only on reparse.
-        # Pushing every seen project here keeps display_name fresh.
-        if seen_projects:
-            with db.viz_conn() as c, c.cursor() as cur:
-                cur.executemany(
-                    "INSERT INTO projects (project_id, display_name, "
-                    "first_seen_at, last_seen_at) "
-                    "VALUES (%(project_id)s, %(display_name)s, "
-                    "%(first_seen_at)s, %(last_seen_at)s) "
-                    "ON CONFLICT (project_id) DO UPDATE SET "
-                    "  display_name = EXCLUDED.display_name, "
-                    "  first_seen_at = LEAST(projects.first_seen_at, "
-                    "                        EXCLUDED.first_seen_at), "
-                    "  last_seen_at = GREATEST(projects.last_seen_at, "
-                    "                          EXCLUDED.last_seen_at)",
-                    list(seen_projects.values()),
-                )
-                c.commit()
-
-        # Orphan files
+def _upsert_projects(seen_projects: dict[str, dict]) -> None:
+    """Unconditional project upsert — even when no files needed reparse,
+    the project marker's path may have changed (e.g. user renamed a
+    work_dir), and the per-file persist runs only on reparse.
+    Pushing every seen project here keeps display_name fresh."""
+    if seen_projects:
         with db.viz_conn() as c, c.cursor() as cur:
-            if seen_keys:
-                cur.execute(
-                    "DELETE FROM files WHERE file_key != ALL(%s) RETURNING 1",
-                    (list(seen_keys),),
-                )
-            else:
-                cur.execute("DELETE FROM files RETURNING 1")
-            deleted = len(cur.fetchall())
+            cur.executemany(
+                "INSERT INTO projects (project_id, display_name, "
+                "first_seen_at, last_seen_at) "
+                "VALUES (%(project_id)s, %(display_name)s, "
+                "%(first_seen_at)s, %(last_seen_at)s) "
+                "ON CONFLICT (project_id) DO UPDATE SET "
+                "  display_name = EXCLUDED.display_name, "
+                "  first_seen_at = LEAST(projects.first_seen_at, "
+                "                        EXCLUDED.first_seen_at), "
+                "  last_seen_at = GREATEST(projects.last_seen_at, "
+                "                          EXCLUDED.last_seen_at)",
+                list(seen_projects.values()),
+            )
             c.commit()
 
-    except Exception as e:  # noqa: BLE001
-        fatal = f"{type(e).__name__}: {e}"
 
+def _delete_orphans(seen_keys: set[str]) -> int:
+    """Orphan files (R2 key gone) are deleted. CASCADE drops records."""
+    with db.viz_conn() as c, c.cursor() as cur:
+        if seen_keys:
+            cur.execute(
+                "DELETE FROM files WHERE file_key != ALL(%s) RETURNING 1",
+                (list(seen_keys),),
+            )
+        else:
+            cur.execute("DELETE FROM files RETURNING 1")
+        deleted = len(cur.fetchall())
+        c.commit()
+    return deleted
+
+
+def _ingest_main(parser_version: str, failed: list[tuple[str, str]]
+                 ) -> tuple[int, int, int, int]:
+    """The whole R2->DB pass. Returns (listed, inserted, reparsed, deleted).
+
+    Any exception propagates to run_ingest, which books it as the run's
+    `fatal` and skips the post-passes.
+    """
+    existing = _existing_files()
+    wire_objs, marker_items = _scan_r2()
+    workers = _worker_count()
+    project_paths = _resolve_project_paths(marker_items, workers, failed)
+    plan = _plan_work(wire_objs, project_paths, existing, parser_version)
+    inserted, reparsed = _fetch_and_persist(
+        plan.todo, workers, parser_version, failed
+    )
+    _upsert_projects(plan.seen_projects)
+    deleted = _delete_orphans(plan.seen_keys)
+    return plan.listed, inserted, reparsed, deleted
+
+
+def _finish_run(run_id: int, started: datetime, trigger: str,
+                counts: tuple[int, int, int, int], fatal: str | None,
+                failed: list[tuple[str, str]]) -> dict:
+    """Book the run's outcome in ingest_runs and build the summary dict."""
+    listed, inserted, reparsed, deleted = counts
     # `error` reports BOTH kinds of trouble, but only `fatal` gates anything.
     err = fatal if fatal is not None else _failure_summary(failed)
-
     finished = datetime.now(timezone.utc)
     with db.viz_conn() as c, c.cursor() as cur:
         cur.execute(
@@ -247,8 +307,7 @@ def run_ingest(trigger: str) -> dict:
             (finished, listed, reparsed, inserted, deleted, err, run_id),
         )
         c.commit()
-
-    summary = {
+    return {
         "id": run_id,
         "started_at": started.isoformat(),
         "finished_at": finished.isoformat(),
@@ -260,6 +319,29 @@ def run_ingest(trigger: str) -> dict:
         "failed": len(failed),
         "error": err,
     }
+
+
+def run_ingest(trigger: str) -> dict:
+    started = datetime.now(timezone.utc)
+    parser_version = os.environ.get("PARSER_VERSION", "1")
+    run_id = _begin_run(started, trigger)
+
+    # (listed, inserted, reparsed, deleted); zeros when the run died early.
+    counts = (0, 0, 0, 0)
+    # Per-object failures (key, message). Recorded in the run's `error`, but
+    # deliberately NOT used to gate anything: one dropped connection out of
+    # 1,464 files is a run with a retry pending, not a failed run.
+    failed: list[tuple[str, str]] = []
+    # A whole-run exception, which DOES gate the post-passes below.
+    fatal = None
+
+    try:
+        counts = _ingest_main(parser_version, failed)
+    except Exception as e:  # noqa: BLE001
+        fatal = f"{type(e).__name__}: {e}"
+
+    summary = _finish_run(run_id, started, trigger, counts, fatal, failed)
+
     # Gated on `fatal`, NOT on `err`: the derived state describes whatever
     # `records` now holds, so skipping the rebuild because one object out of
     # a thousand could not be fetched is what leaves the rollups and
@@ -280,7 +362,7 @@ def run_ingest(trigger: str) -> dict:
     # servable — the refetch returns the previous numbers instantly and the
     # fresh ones land via the background refresh. Threadsafe: ingest runs in
     # a scheduler thread.
-    if fatal is None and (inserted or reparsed or deleted):
+    if fatal is None and any(counts[1:]):
         cache.response_cache.invalidate()
         events.broadcast_threadsafe("ingest_done", summary)
 
@@ -433,7 +515,7 @@ def rebuild_latency_rollup() -> int:
                 ("''", ""),
             ):
                 cur = c.execute(
-                    f"""
+                    db.sql_literal(f"""
                     WITH src AS (
                       SELECT to_timestamp(
                                floor(EXTRACT(EPOCH FROM r.ts) / {bs}) * {bs} + {bs} / 2
@@ -484,7 +566,7 @@ def rebuild_latency_rollup() -> int:
                            b.p10, b.p50, b.p90, COALESCE(p.outliers, '[]'::jsonb)
                       FROM bands b
                       LEFT JOIN picked p USING (bucket, project_id, model)
-                    """
+                    """)
                 )
                 written += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
         c.commit()
@@ -513,8 +595,6 @@ def warm_common() -> None:
     """
     if os.environ.get("KIMIMETER_WARM_CACHE", "1").lower() in ("0", "false", "no"):
         return
-
-    from backend import api
 
     # Every range the picker offers, so no button lands on a cold query.
     # Must mirror RangePicker's preset values in src/app.jsx — a range the

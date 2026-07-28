@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+from typing import LiteralString, cast
 from psycopg_pool import ConnectionPool
 
 _VIZ: ConnectionPool | None = None
@@ -41,6 +42,19 @@ def auth_pool() -> ConnectionPool:
             kwargs={"autocommit": True},
         )
     return _AUTH
+
+
+def sql_literal(text: str) -> LiteralString:
+    """Mark a dynamically assembled query as a literal for the type checker.
+
+    psycopg types execute()'s query parameter as LiteralString so user
+    input is pushed through bind parameters. The queries in this codebase
+    interpolate only trusted internal fragments — integer bucket widths,
+    and filter snippets from api.py's _proj_* helpers, which interpolate
+    nothing user-controlled; every user value goes through %s. This
+    wrapper says so once, at the source, instead of casting per call site.
+    """
+    return cast(LiteralString, text)
 
 
 @contextmanager
