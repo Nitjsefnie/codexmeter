@@ -2,12 +2,43 @@ import json
 import os
 import shutil
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
+import psycopg
 import pytest
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
+from backend import api as api_mod
+from backend import api_dashboard as api_dash_mod
+from backend import api_sessions as api_sess_mod
+from backend import cache, db, ingest, pricing
+from backend.api import _tool_source
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@contextmanager
+def _pg_cur():
+    """Cursor over a direct psycopg connection to the scratch DB.
+
+    Written WITHOUT `with psycopg.connect(...)`: pylint infers the
+    return of Connection.connect as None (it cannot follow the retry
+    loop's reassignment) and reports not-context-manager — a false
+    positive this explicit try/finally sidesteps while keeping the same
+    commit-on-success / rollback-on-error semantics.
+    """
+    conn = psycopg.connect(os.environ["DATABASE_URL_VIZ"])
+    try:
+        cur = conn.cursor()
+        try:
+            yield cur
+        finally:
+            cur.close()
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _build_app(monkeypatch, pre_ingest=None, test_db="kimimeter_test_api"):
@@ -28,21 +59,10 @@ def _build_app(monkeypatch, pre_ingest=None, test_db="kimimeter_test_api"):
     if pre_ingest is not None:
         pre_ingest(Path(tmp) / "r2")
 
-    from backend import db as _db
-    if _db._VIZ is not None:
-        try:
-            _db._VIZ.close()
-        except Exception:
-            pass
-    _db._VIZ = None
+    db.close_viz_pool()
 
-    from backend import ingest
     ingest.run_ingest(trigger="manual")
 
-    from fastapi import FastAPI
-    from backend import api as api_mod
-    from backend import api_dashboard as api_dash_mod
-    from backend import api_sessions as api_sess_mod
     a = FastAPI()
     a.include_router(api_mod.router)
     a.include_router(api_dash_mod.router)
@@ -50,12 +70,7 @@ def _build_app(monkeypatch, pre_ingest=None, test_db="kimimeter_test_api"):
 
     yield TestClient(a)
 
-    if _db._VIZ is not None:
-        try:
-            _db._VIZ.close()
-        except Exception:
-            pass
-    _db._VIZ = None
+    db.close_viz_pool()
     shutil.rmtree(tmp)
     os.system(f"dropdb --if-exists {test_db} 2>/dev/null")
 
@@ -65,8 +80,8 @@ def _build_app(monkeypatch, pre_ingest=None, test_db="kimimeter_test_api"):
 # and was seconds of pure `setup` on every one of ~40 read-only tests —
 # the bulk of the suite's runtime. Tests that WRITE must not share it;
 # they take `app_with_fresh_data` below.
-@pytest.fixture(scope="module")
-def app_with_data():
+@pytest.fixture(scope="module", name="app_with_data")
+def _app_with_data():
     mp = pytest.MonkeyPatch()          # monkeypatch itself is function-scoped
     try:
         yield from _build_app(mp)
@@ -74,8 +89,8 @@ def app_with_data():
         mp.undo()
 
 
-@pytest.fixture
-def app_with_fresh_data():
+@pytest.fixture(name="app_with_fresh_data")
+def _app_with_fresh_data():
     """Function-scoped variant for tests that MUTATE rows, so they cannot
     contaminate the shared module-scoped client."""
     mp = pytest.MonkeyPatch()
@@ -85,8 +100,8 @@ def app_with_fresh_data():
         mp.undo()
 
 
-@pytest.fixture
-def app_with_unresolved():
+@pytest.fixture(name="app_with_unresolved")
+def _app_with_unresolved():
     """Plain fixture plus two junk hash-projects (no project.json marker).
 
     Function-scoped ON PURPOSE, unlike `app_with_data`. Both fixtures point
@@ -130,8 +145,8 @@ def app_with_unresolved():
         mp.undo()
 
 
-@pytest.fixture
-def app_with_two_models():
+@pytest.fixture(name="app_with_two_models")
+def _app_with_two_models():
     """Plain fixture plus one extra session dated before
     parse.MODEL_CUTOFF_DT, so it resolves to "kimi-k2-6" instead of the
     "kimi-k2-7-code" every other fixture session gets. All fixture data
@@ -186,8 +201,7 @@ def test_projects_range_scoped_ordering_and_zero_cost_exclusion(app_with_fresh_d
     not be conflated. A project with real all-time cost but nothing in the
     selected range stays listed, sorted last, with its reported (range)
     cost at 0."""
-    import psycopg
-    with psycopg.connect(os.environ["DATABASE_URL_VIZ"]) as conn, conn.cursor() as cur:
+    with _pg_cur() as cur:
         cur.execute(
             "INSERT INTO projects (project_id, display_name, first_seen_at, last_seen_at) VALUES "
             "('projNeverCost', 'projNeverCost', now(), now()), "
@@ -210,7 +224,6 @@ def test_projects_range_scoped_ordering_and_zero_cost_exclusion(app_with_fresh_d
             # proving the ordering is RANGE-scoped, not all-time.
             "('sess-recent', 'projRecentCost', now() - interval '1 hour', 'm', TRUE, now(), now(), 1, 1.00)"
         )
-        conn.commit()
 
     r = app_with_fresh_data.get("/api/projects?range=7d")
     assert r.status_code == 200
@@ -320,8 +333,6 @@ def test_cache_session_total_estimated_rate_true_when_any_model_estimated(
     "default" (estimated) while kimi-k2-7-code stays exact — a genuine
     mixed session.
     """
-    from backend import pricing
-
     patched = {k: v for k, v in pricing.MODEL_RATES.items() if k != "kimi-k2-6"}
     monkeypatch.setattr(pricing, "MODEL_RATES", patched)
 
@@ -354,7 +365,6 @@ def test_transcript_streams(app_with_data):
     r = app_with_data.get("/api/sessions/sess-A/transcript")
     assert r.status_code == 200
     assert r.headers["content-type"] == "application/x-ndjson"
-    import json
     first = r.text.split("\n")[0]
     obj = json.loads(first)
     # Kimi wire.jsonl puts the event type under message.type.
@@ -493,8 +503,7 @@ def test_projects_unaffected_without_junk(app_with_data):
 def _insert_tz_probe_rows():
     """Two records with a unique model, one in winter (CET, UTC+1) and one
     in summer (CEST, UTC+2), to prove the endpoint is DST-aware."""
-    import psycopg
-    with psycopg.connect(os.environ["DATABASE_URL_VIZ"]) as conn, conn.cursor() as cur:
+    with _pg_cur() as cur:
         cur.execute(
             "INSERT INTO projects (project_id, display_name, first_seen_at, last_seen_at) "
             "VALUES ('projTZ', 'projTZ', now(), now()) ON CONFLICT DO NOTHING"
@@ -511,14 +520,12 @@ def _insert_tz_probe_rows():
             # 2026-07-15 is a Wednesday (ISODOW 3); 10:30Z in CEST (UTC+2) is 12:30 local.
             "('projTZ/tz.jsonl', 2, 'uuid-tz-summer', '2026-07-15T10:30:00Z', 'tz-probe-model', 20, 0.02)"
         )
-        conn.commit()
 
     # /api/activity-heatmap reads usage_rollup, which ingest rebuilds from
     # `records`. These rows were inserted behind ingest's back, so rebuild
     # it here or the endpoint cannot see them (SV-ROLLUP: the rollup is
     # derived state; anything mutating `records` outside ingest must
     # rebuild it).
-    from backend import ingest
     ingest.rebuild_rollup()
 
 
@@ -570,8 +577,6 @@ def test_activity_heatmap_bad_range_400(app_with_data):
 
 
 def test_dashboard_response_is_cached_and_fresh_bypasses(app_with_fresh_data):
-    from backend import cache, db
-
     cache.response_cache.clear()
     first = app_with_fresh_data.get("/api/dashboard?range=all").json()
 
@@ -623,9 +628,6 @@ def test_dashboard_cost_by_project_omitted_for_guest(app_with_data):
     reuses the non-guest call's query params, so it is served from the
     SHARED response cache — proving the strip happens per-request,
     outside the cached payload."""
-    from fastapi import FastAPI, Request
-    from backend import api_dashboard as api_dash_mod
-
     body = app_with_data.get("/api/dashboard?range=3650d").json()
     assert "cost_by_project" in body
 
@@ -654,8 +656,7 @@ def _insert_latency_probe_rows():
     150 rows in one hour means 1% is 2 dots per end — enough to catch a
     floor-vs-ceil cutoff, which is exactly the bug this rollup invites.
     """
-    import psycopg
-    with psycopg.connect(os.environ["DATABASE_URL_VIZ"]) as conn, conn.cursor() as cur:
+    with _pg_cur() as cur:
         cur.execute(
             "INSERT INTO records (file_key, line_num, uuid, ts, model, "
             "                     output_tokens, cost_usd, reply_latency_s) "
@@ -665,9 +666,7 @@ def _insert_latency_probe_rows():
             "FROM files f, generate_series(1, 150) AS i "
             "WHERE f.file_key = (SELECT MIN(file_key) FROM files)"
         )
-        conn.commit()
 
-    from backend import ingest
     ingest.recompute_canonical()
     ingest.rebuild_latency_rollup()
 
@@ -681,9 +680,6 @@ def test_reply_latency_rollup_matches_live_path(app_with_fresh_data, monkeypatch
     cutoff, a bucket-centering mismatch), so compare the two paths rather
     than trusting the port.
     """
-    from backend import api as api_mod
-    from backend import cache
-
     _insert_latency_probe_rows()
 
     rolled = app_with_fresh_data.get("/api/reply-latency?range=3650d").json()
@@ -708,8 +704,7 @@ def _insert_tool_probe_rows():
     both present because the two endpoints count different populations:
     tool-usage counts all of them, tool-error-rate only the settled ones.
     """
-    import psycopg
-    with psycopg.connect(os.environ["DATABASE_URL_VIZ"]) as conn, conn.cursor() as cur:
+    with _pg_cur() as cur:
         cur.execute(
             "INSERT INTO tool_uses (file_key, line_num, idx, ts, tool_name, is_error) "
             "SELECT f.file_key, 9000 + i, 0, "
@@ -720,17 +715,12 @@ def _insert_tool_probe_rows():
             "FROM files f, generate_series(1, 30) AS i "
             "WHERE f.file_key = (SELECT MIN(file_key) FROM files)"
         )
-        conn.commit()
 
-    from backend import ingest
     ingest.rebuild_tool_rollup()
 
 
 def test_tool_endpoints_rollup_matches_live_path(app_with_fresh_data, monkeypatch):
     """tool_rollup must return exactly what the live per-call query does."""
-    from backend import api as api_mod
-    from backend import cache
-
     _insert_tool_probe_rows()
 
     rolled_usage = app_with_fresh_data.get("/api/tool-usage?range=3650d").json()
@@ -741,7 +731,7 @@ def test_tool_endpoints_rollup_matches_live_path(app_with_fresh_data, monkeypatc
     assert (sum(b["n"] for b in rolled_usage["buckets"])
             > sum(b["n_total"] for b in rolled_errors["buckets"]))
 
-    live_source = api_mod._tool_source(60)      # the live subquery branch
+    live_source = _tool_source(60)      # the live subquery branch
     monkeypatch.setattr(api_mod, "_tool_source", lambda bucket_s: live_source)
     cache.response_cache.clear()
     live_usage = app_with_fresh_data.get("/api/tool-usage?range=3650d").json()
@@ -786,17 +776,13 @@ def test_rate_limit_hits_are_filtered_on_the_hits_own_ts(app_with_fresh_data):
     7-day view. The hit's own `ts` is what the panel plots, so that is what
     must be filtered.
     """
-    import psycopg
-    from backend import cache
-
-    with psycopg.connect(os.environ["DATABASE_URL_VIZ"]) as conn, conn.cursor() as cur:
+    with _pg_cur() as cur:
         cur.execute(
             "UPDATE files SET r2_last_modified = now(), "
             "       rate_limit_hits = '[{\"ts\":\"2025-07-26T10:00:00Z\","
             "                            \"content\":\"old hit\"}]'::jsonb "
             " WHERE file_key = (SELECT MIN(file_key) FROM files WHERE is_main)"
         )
-        conn.commit()
 
     cache.response_cache.clear()
     short = app_with_fresh_data.get("/api/dashboard?range=7d").json()
@@ -822,10 +808,7 @@ def test_a_malformed_hit_ts_does_not_take_down_the_dashboard(app_with_fresh_data
     matches the shape passes them straight through to the cast it was
     meant to protect. Only real input validation excludes them.
     """
-    import psycopg
-    from backend import cache
-
-    with psycopg.connect(os.environ["DATABASE_URL_VIZ"]) as conn, conn.cursor() as cur:
+    with _pg_cur() as cur:
         cur.execute(
             "UPDATE files SET r2_last_modified = now(), "
             "       rate_limit_hits = %s::jsonb "
@@ -847,7 +830,6 @@ def test_a_malformed_hit_ts_does_not_take_down_the_dashboard(app_with_fresh_data
                 {"ts": "1998-01-01T00:00:00Z", "content": "too old"},
             ]),),
         )
-        conn.commit()
 
     cache.response_cache.clear()
     r = app_with_fresh_data.get("/api/dashboard?range=30d")

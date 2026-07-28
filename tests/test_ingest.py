@@ -1,15 +1,19 @@
+import inspect
 import json
 import lzma
 import os
 import shutil
 import tempfile
 import threading
+import time
 from collections import Counter
 from pathlib import Path
 
 import pytest
+from botocore.exceptions import ConnectionClosedError
 
-from backend import db, ingest
+from backend import api, api_dashboard, cache, db, ingest
+from backend.ingest import _failure_summary
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -18,38 +22,40 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _FLAKY_KEY = "sessions/projA/sess-A/wire.jsonl"
 
 
-@pytest.fixture
-def fresh_db(monkeypatch):
+@pytest.fixture(name="fresh_db")
+def _fresh_db(monkeypatch):
     """Per-test schema reset on a separate DB."""
     test_db = "kimimeter_test"
     os.system(f"dropdb --if-exists {test_db} 2>/dev/null")
     os.system(f"createdb {test_db} 2>/dev/null")
     os.system(f"psql {test_db} -f {_REPO_ROOT / 'backend/schema.sql'} >/dev/null")
     monkeypatch.setenv("DATABASE_URL_VIZ", f"postgresql:///{test_db}")
-    if db._VIZ is not None:
-        try:
-            db._VIZ.close()
-        except Exception:
-            pass
-    db._VIZ = None
+    db.close_viz_pool()
     yield
-    if db._VIZ is not None:
-        try:
-            db._VIZ.close()
-        except Exception:
-            pass
-    db._VIZ = None
+    db.close_viz_pool()
     os.system(f"dropdb --if-exists {test_db} 2>/dev/null")
 
 
-@pytest.fixture
-def mini_r2_env(monkeypatch):
+@pytest.fixture(name="mini_r2_env")
+def _mini_r2_env(monkeypatch):
     src = _REPO_ROOT / "fixtures/r2_mini"
     tmp = tempfile.mkdtemp(prefix="kd-ingest-")
     shutil.copytree(src, Path(tmp) / "r2")
     monkeypatch.setenv("R2_ENDPOINT", f"file://{tmp}/r2/")
     yield Path(tmp) / "r2" / "kimi"
     shutil.rmtree(tmp)
+
+
+def _scalar(c, sql: str, args: tuple = ()):
+    """First column of the first row of a query that must return one.
+
+    COUNT/MAX-style aggregates always yield a row; fetchone() is typed
+    Optional, so a None here means the test's premise broke — assert
+    instead of subscripting it.
+    """
+    row = c.execute(sql, args).fetchone()
+    assert row is not None, f"query returned no rows: {sql[:60]}"
+    return row[0]
 
 
 def _wire_blob(message_id, input_other, output):
@@ -69,13 +75,13 @@ def test_ingest_inserts_one_row_per_jsonl(fresh_db, mini_r2_env):
     assert result["error"] is None
     assert result["inserted"] == 5
     with db.viz_conn() as c:
-        n = c.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        n = _scalar(c, "SELECT COUNT(*) FROM files")
         assert n == 5
-        n_main = c.execute("SELECT COUNT(*) FROM files WHERE is_main").fetchone()[0]
+        n_main = _scalar(c, "SELECT COUNT(*) FROM files WHERE is_main")
         assert n_main == 4
-        n_sess = c.execute("SELECT COUNT(DISTINCT session_id) FROM files").fetchone()[0]
+        n_sess = _scalar(c, "SELECT COUNT(DISTINCT session_id) FROM files")
         assert n_sess == 4
-        n_proj = c.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+        n_proj = _scalar(c, "SELECT COUNT(*) FROM projects")
         assert n_proj == 2
 
 
@@ -85,15 +91,15 @@ def test_records_populated_with_no_write_time_dedup(fresh_db, mini_r2_env):
     — so records has ALL three rows. Query-time DISTINCT ON is the dedup."""
     ingest.run_ingest(trigger="manual")
     with db.viz_conn() as c:
-        n = c.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+        n = _scalar(c, "SELECT COUNT(*) FROM records")
         assert n > 0
-        cnt = c.execute(
-            "SELECT COUNT(*) FROM records WHERE uuid = 'shared-uuid-1'"
-        ).fetchone()[0]
+        cnt = _scalar(
+            c, "SELECT COUNT(*) FROM records WHERE uuid = 'shared-uuid-1'"
+        )
         assert cnt == 3
-        cnt_distinct = c.execute(
-            "SELECT COUNT(DISTINCT uuid) FROM records WHERE uuid = 'shared-uuid-1'"
-        ).fetchone()[0]
+        cnt_distinct = _scalar(
+            c, "SELECT COUNT(DISTINCT uuid) FROM records WHERE uuid = 'shared-uuid-1'"
+        )
         assert cnt_distinct == 1
 
 
@@ -110,17 +116,17 @@ def test_ctx_turns_stored_per_file(fresh_db, mini_r2_env):
 def test_etag_change_triggers_per_file_reparse(fresh_db, mini_r2_env):
     ingest.run_ingest(trigger="manual")
     with db.viz_conn() as c:
-        before_etag = c.execute(
-            "SELECT r2_etag FROM files WHERE file_key LIKE '%sess-A/wire.jsonl'"
-        ).fetchone()[0]
+        before_etag = _scalar(
+            c, "SELECT r2_etag FROM files WHERE file_key LIKE '%sess-A/wire.jsonl'"
+        )
     target = mini_r2_env / "sessions" / "projA" / "sess-A" / "wire.jsonl"
     target.write_text(target.read_text() + "\n")
     result = ingest.run_ingest(trigger="manual")
     assert result["reparsed"] == 1
     with db.viz_conn() as c:
-        after_etag = c.execute(
-            "SELECT r2_etag FROM files WHERE file_key LIKE '%sess-A/wire.jsonl'"
-        ).fetchone()[0]
+        after_etag = _scalar(
+            c, "SELECT r2_etag FROM files WHERE file_key LIKE '%sess-A/wire.jsonl'"
+        )
     assert before_etag != after_etag
 
 
@@ -138,9 +144,9 @@ def test_deleted_file_removed(fresh_db, mini_r2_env):
     result = ingest.run_ingest(trigger="manual")
     assert result["deleted"] == 1
     with db.viz_conn() as c:
-        n = c.execute(
-            "SELECT COUNT(*) FROM files WHERE file_key LIKE '%sess-B/wire.jsonl'"
-        ).fetchone()[0]
+        n = _scalar(
+            c, "SELECT COUNT(*) FROM files WHERE file_key LIKE '%sess-B/wire.jsonl'"
+        )
         assert n == 0
 
 
@@ -150,9 +156,9 @@ def test_records_cascade_on_file_delete(fresh_db, mini_r2_env):
     target.unlink()
     ingest.run_ingest(trigger="manual")
     with db.viz_conn() as c:
-        n = c.execute(
-            "SELECT COUNT(*) FROM records WHERE file_key LIKE '%sess-A/wire.jsonl'"
-        ).fetchone()[0]
+        n = _scalar(
+            c, "SELECT COUNT(*) FROM records WHERE file_key LIKE '%sess-A/wire.jsonl'"
+        )
         assert n == 0
 
 
@@ -255,9 +261,6 @@ def test_warm_common_covers_every_warmed_range(fresh_db, mini_r2_env, monkeypatc
     to the endpoint's signature default ("30d") while the UI opens on
     "all", so the one request every page load makes was never warmed.
     """
-    import time as _time
-    from backend import api, api_dashboard, cache
-
     monkeypatch.setenv("KIMIMETER_WARM_CACHE", "1")
     ingest.run_ingest(trigger="manual")
 
@@ -266,9 +269,9 @@ def test_warm_common_covers_every_warmed_range(fresh_db, mini_r2_env, monkeypatc
         api.tool_error_rate, api.reply_latency, api.list_projects,
     )
     # The warms run on a background pool; give them a bounded moment.
-    deadline = _time.time() + 60
+    deadline = time.time() + 60
     missing = None
-    while _time.time() < deadline:
+    while time.time() < deadline:
         missing = [
             f"{fn.__qualname__}(range={rng})"
             for rng in ingest.WARM_RANGES
@@ -277,7 +280,7 @@ def test_warm_common_covers_every_warmed_range(fresh_db, mini_r2_env, monkeypatc
         ]
         if not missing:
             break
-        _time.sleep(0.25)
+        time.sleep(0.25)
 
     assert not missing, "warm_common left these uncached: " + ", ".join(missing)
 
@@ -288,9 +291,6 @@ def _warm_key(fn, rng: str) -> str:
     Built from the endpoint's own signature so it stays correct as params
     are added — which is exactly what broke /api/projects.
     """
-    import inspect
-    from fastapi import Query  # noqa: F401  (Query defaults unwrap below)
-
     target = getattr(fn, "__wrapped__", fn)
     kwargs = {}
     for name, param in inspect.signature(target).parameters.items():
@@ -315,8 +315,6 @@ def test_ingest_marks_response_cache_stale(fresh_db, mini_r2_env):
     each ingest. Stale-while-revalidate keeps the previous numbers
     available while the refresh runs off the request path.
     """
-    from backend import cache
-
     cache.response_cache.put("stale-key", {"v": "old"})
     entry = cache.response_cache.get_entry("stale-key")
     assert entry == ({"v": "old"}, False), "fresh before ingest"
@@ -334,25 +332,24 @@ def test_first_seen_at_uses_least(fresh_db, mini_r2_env):
     """projects.first_seen_at must NOT be locked at first-ingest mtime.
     Add a NEW file under an existing project with an earlier mtime;
     re-ingest must drag first_seen_at backward via LEAST(...) in ON CONFLICT."""
-    import os as _os
     ingest.run_ingest(trigger="manual")
     with db.viz_conn() as c:
-        before = c.execute(
-            "SELECT first_seen_at FROM projects WHERE project_id = 'projA'"
-        ).fetchone()[0]
+        before = _scalar(
+            c, "SELECT first_seen_at FROM projects WHERE project_id = 'projA'"
+        )
 
     new_dir = mini_r2_env / "sessions" / "projA" / "sess-NEW"
     new_dir.mkdir()
     new_file = new_dir / "wire.jsonl"
     new_file.write_bytes(_wire_blob("u-new", 1, 1))
     older_ts = before.timestamp() - 3600
-    _os.utime(new_file, (older_ts, older_ts))
+    os.utime(new_file, (older_ts, older_ts))
 
     ingest.run_ingest(trigger="manual")
     with db.viz_conn() as c:
-        after = c.execute(
-            "SELECT first_seen_at FROM projects WHERE project_id = 'projA'"
-        ).fetchone()[0]
+        after = _scalar(
+            c, "SELECT first_seen_at FROM projects WHERE project_id = 'projA'"
+        )
     assert after < before, f"first_seen_at should move backward: was {before}, now {after}"
 
 
@@ -365,8 +362,8 @@ def test_pool_and_sequential_ingest_agree(fresh_db, mini_r2_env, monkeypatch):
         result = ingest.run_ingest(trigger="manual")
         assert result["error"] is None
         with db.viz_conn() as c:
-            files = c.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-            records = c.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+            files = _scalar(c, "SELECT COUNT(*) FROM files")
+            records = _scalar(c, "SELECT COUNT(*) FROM records")
         return files, records
 
     seq_files, seq_records = _counts_after_ingest(1)
@@ -376,9 +373,7 @@ def test_pool_and_sequential_ingest_agree(fresh_db, mini_r2_env, monkeypatch):
     os.system(f"dropdb --if-exists {test_db} 2>/dev/null")
     os.system(f"createdb {test_db} 2>/dev/null")
     os.system(f"psql {test_db} -f {_REPO_ROOT / 'backend/schema.sql'} >/dev/null")
-    if db._VIZ is not None:
-        db._VIZ.close()
-    db._VIZ = None
+    db.close_viz_pool()
 
     par_files, par_records = _counts_after_ingest(4)
     assert seq_files == par_files
@@ -409,7 +404,7 @@ def _patch_fetch(monkeypatch, key, fail_times, exc=None):
         return real_get(k)
 
     monkeypatch.setattr(ingest.r2, "get_object", flaky)
-    monkeypatch.setattr(ingest.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(ingest.time, "sleep", slept.append)
     return counts, slept
 
 
@@ -454,12 +449,8 @@ def test_per_object_failure_still_rebuilds_derived_state(
     """
     ingest.run_ingest(trigger="manual")
     with db.viz_conn() as c:
-        rollup_before = c.execute(
-            "SELECT COUNT(*) FROM usage_rollup"
-        ).fetchone()[0]
-        dupes_before = c.execute(
-            "SELECT COUNT(*) FROM records WHERE NOT is_canonical"
-        ).fetchone()[0]
+        rollup_before = _scalar(c, "SELECT COUNT(*) FROM usage_rollup")
+        dupes_before = _scalar(c, "SELECT COUNT(*) FROM records WHERE NOT is_canonical")
     assert rollup_before > 0 and dupes_before > 0, "fixture proves nothing"
 
     with db.viz_conn() as c:
@@ -483,15 +474,9 @@ def test_per_object_failure_still_rebuilds_derived_state(
     assert result["reparsed"] == 4
 
     with db.viz_conn() as c:
-        rollup_after = c.execute(
-            "SELECT COUNT(*) FROM usage_rollup"
-        ).fetchone()[0]
-        dupes_after = c.execute(
-            "SELECT COUNT(*) FROM records WHERE NOT is_canonical"
-        ).fetchone()[0]
-        tool_rollup_after = c.execute(
-            "SELECT COUNT(*) FROM tool_rollup"
-        ).fetchone()[0]
+        rollup_after = _scalar(c, "SELECT COUNT(*) FROM usage_rollup")
+        dupes_after = _scalar(c, "SELECT COUNT(*) FROM records WHERE NOT is_canonical")
+        tool_rollup_after = _scalar(c, "SELECT COUNT(*) FROM tool_rollup")
     assert rollup_after == rollup_before, "usage_rollup was not rebuilt"
     assert dupes_after == dupes_before, "is_canonical was not recomputed"
     assert tool_rollup_after > 0, "tool_rollup was not rebuilt"
@@ -511,9 +496,9 @@ def test_a_transient_fetch_failure_is_retried_and_recovers(
     assert counts[_FLAKY_KEY] == 3
     assert slept == [0.5, 1.0], "exponential backoff between attempts"
     with db.viz_conn() as c:
-        n = c.execute(
-            "SELECT COUNT(*) FROM files WHERE file_key = %s", (_FLAKY_KEY,)
-        ).fetchone()[0]
+        n = _scalar(
+            c, "SELECT COUNT(*) FROM files WHERE file_key = %s", (_FLAKY_KEY,)
+        )
     assert n == 1
 
 
@@ -564,12 +549,12 @@ def test_a_corrupt_xz_object_is_one_failure_not_a_dead_run(
     )
     assert result["inserted"] == 5, "the intact objects are still persisted"
     assert counts[_CORRUPT_XZ_KEY] == 1, "a corrupt object must not be re-fetched"
-    assert slept == [], "and must not sleep between attempts it does not make"
+    assert not slept, "and must not sleep between attempts it does not make"
     with db.viz_conn() as c:
-        rollup = c.execute("SELECT COUNT(*) FROM usage_rollup").fetchone()[0]
-        stored = c.execute(
-            "SELECT COUNT(*) FROM files WHERE file_key = %s", (_CORRUPT_XZ_KEY,)
-        ).fetchone()[0]
+        rollup = _scalar(c, "SELECT COUNT(*) FROM usage_rollup")
+        stored = _scalar(
+            c, "SELECT COUNT(*) FROM files WHERE file_key = %s", (_CORRUPT_XZ_KEY,)
+        )
     assert rollup > 0, "derived state must still be rebuilt"
     assert stored == 0
 
@@ -591,12 +576,12 @@ def test_a_programming_error_in_the_fetch_is_not_retried(
     result = ingest.run_ingest(trigger="manual")
 
     assert counts[_FLAKY_KEY] == 1, "a bug must not be retried"
-    assert slept == [], "and must not sleep"
+    assert not slept, "and must not sleep"
     assert result["failed"] == 0, "it is not a per-object failure"
     assert result["error"].startswith("FatalFetchError:"), result["error"]
     assert "TypeError" in result["error"], "the type must survive into the run"
     with db.viz_conn() as c:
-        rollup = c.execute("SELECT COUNT(*) FROM usage_rollup").fetchone()[0]
+        rollup = _scalar(c, "SELECT COUNT(*) FROM usage_rollup")
     assert rollup == 0, "a fatal run must not rebuild derived state"
 
 
@@ -653,8 +638,6 @@ def test_a_failed_marker_fetch_does_not_abort_the_run(
     catch never saw them and the exception escaped the collection step
     before r2_listed had even been counted.
     """
-    from botocore.exceptions import ConnectionClosedError
-
     _write_marker(mini_r2_env)
     monkeypatch.setenv("INGEST_WORKERS", str(workers))
     boom = ConnectionClosedError(endpoint_url="https://acct.r2.cloudflarestorage.com")
@@ -669,10 +652,10 @@ def test_a_failed_marker_fetch_does_not_abort_the_run(
     assert result["inserted"] == 5, "and still persisted"
     assert counts[_MARKER_KEY] == ingest.FETCH_ATTEMPTS, "the GET is retried"
     with db.viz_conn() as c:
-        rollup = c.execute("SELECT COUNT(*) FROM usage_rollup").fetchone()[0]
-        display = c.execute(
-            "SELECT display_name FROM projects WHERE project_id = 'projA'"
-        ).fetchone()[0]
+        rollup = _scalar(c, "SELECT COUNT(*) FROM usage_rollup")
+        display = _scalar(
+            c, "SELECT display_name FROM projects WHERE project_id = 'projA'"
+        )
     assert rollup > 0, "derived state must still be rebuilt"
     assert display == "projA", "an unreadable marker degrades to the id"
 
@@ -690,9 +673,9 @@ def test_a_malformed_marker_degrades_without_counting_as_a_failure(
     assert result["failed"] == 0
     assert result["error"] is None
     with db.viz_conn() as c:
-        display = c.execute(
-            "SELECT display_name FROM projects WHERE project_id = 'projA'"
-        ).fetchone()[0]
+        display = _scalar(
+            c, "SELECT display_name FROM projects WHERE project_id = 'projA'"
+        )
     assert display == "projA"
 
 
@@ -704,9 +687,9 @@ def test_a_readable_marker_still_names_the_project(fresh_db, mini_r2_env):
 
     assert result["failed"] == 0
     with db.viz_conn() as c:
-        display = c.execute(
-            "SELECT display_name FROM projects WHERE project_id = 'projA'"
-        ).fetchone()[0]
+        display = _scalar(
+            c, "SELECT display_name FROM projects WHERE project_id = 'projA'"
+        )
     assert display == "/root/work/projA"
 
 
@@ -714,8 +697,9 @@ def test_failure_summary_truncates_a_long_key_list():
     """A 1,464-file run losing its connection must not write a novel into
     ingest_runs.error."""
     failed = [(f"sessions/p/s{i}/wire.jsonl", "OSError: boom") for i in range(9)]
-    summary = ingest._failure_summary(failed)
+    summary = _failure_summary(failed)
+    assert summary is not None
     assert summary.startswith("9 objects failed after retries: ")
     assert summary.endswith(", ... (+4 more)")
     assert summary.count("wire.jsonl") == ingest.FAILURE_KEYS_IN_SUMMARY
-    assert ingest._failure_summary([]) is None
+    assert _failure_summary([]) is None

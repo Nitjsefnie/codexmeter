@@ -44,6 +44,22 @@ def auth_pool() -> ConnectionPool:
     return _AUTH
 
 
+def close_viz_pool() -> None:
+    """Close and drop the cached viz pool.
+
+    Test teardown uses this after repointing DATABASE_URL_VIZ at a scratch
+    database: the next viz_pool() call rebuilds against the new DSN
+    instead of serving pooled connections to the dropped one.
+    """
+    global _VIZ
+    if _VIZ is not None:
+        try:
+            _VIZ.close()
+        except Exception:  # noqa: BLE001 — teardown must not fail the test
+            pass
+    _VIZ = None
+
+
 def sql_literal(text: str) -> LiteralString:
     """Mark a dynamically assembled query as a literal for the type checker.
 

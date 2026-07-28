@@ -73,9 +73,10 @@ class Resolution:
         return self.kind != "exact"
 
 
-def _normalise(model: str) -> str:
+def _normalise(model: str | None) -> str:
     """Case-fold and normalise version separators: "Kimi-K2.7-code" and
-    "kimi-k2-7-code" name the same model.
+    "kimi-k2-7-code" name the same model. None (a NULL model off a DB
+    row) normalises to "" and lands on the default rates.
 
     Deliberately does NOT strip a provider prefix the way claudit's
     normaliser does. parse._canonical_model already reduces raw wire ids
@@ -103,7 +104,7 @@ def _match_key(norm: str) -> str | None:
     return None
 
 
-def resolve(model: str) -> Resolution:
+def resolve(model: str | None) -> Resolution:
     """Resolve a model id to rates, reporting how confident the match is."""
     key = _match_key(_normalise(model))
     if key is not None:
@@ -111,7 +112,7 @@ def resolve(model: str) -> Resolution:
     return Resolution(DEFAULT_RATES, "default")
 
 
-def rate_for(model: str) -> dict:
+def rate_for(model: str | None) -> dict:
     """Rates for a model. Callers that render cost should prefer resolve(),
     whose .estimated says whether the rates were matched or assumed.
     """
