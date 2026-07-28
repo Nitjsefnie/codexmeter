@@ -41,8 +41,12 @@ def _build_app(monkeypatch, pre_ingest=None, test_db="kimimeter_test_api"):
 
     from fastapi import FastAPI
     from backend import api as api_mod
+    from backend import api_dashboard as api_dash_mod
+    from backend import api_sessions as api_sess_mod
     a = FastAPI()
     a.include_router(api_mod.router)
+    a.include_router(api_dash_mod.router)
+    a.include_router(api_sess_mod.router)
 
     yield TestClient(a)
 
@@ -613,13 +617,14 @@ def test_dashboard_cost_by_project_omitted_for_guest(app_with_data):
     missing from the response body itself, not merely unrendered by the
     frontend.
 
-    This suite mounts only api.router (auth bypassed), so a guest is
-    simulated by a middleware setting the SAME request.state.is_guest
-    flag the real middleware sets. The guest call reuses the non-guest
-    call's query params, so it is served from the SHARED response cache —
-    proving the strip happens per-request, outside the cached payload."""
+    This suite mounts the api routers without auth (auth bypassed), so a
+    guest is simulated by a middleware setting the SAME
+    request.state.is_guest flag the real middleware sets. The guest call
+    reuses the non-guest call's query params, so it is served from the
+    SHARED response cache — proving the strip happens per-request,
+    outside the cached payload."""
     from fastapi import FastAPI, Request
-    from backend import api as api_mod
+    from backend import api_dashboard as api_dash_mod
 
     body = app_with_data.get("/api/dashboard?range=3650d").json()
     assert "cost_by_project" in body
@@ -631,7 +636,7 @@ def test_dashboard_cost_by_project_omitted_for_guest(app_with_data):
         request.state.is_guest = True
         return await call_next(request)
 
-    a.include_router(api_mod.router)
+    a.include_router(api_dash_mod.router)
     guest = TestClient(a).get("/api/dashboard?range=3650d")
     assert guest.status_code == 200
     assert "cost_by_project" not in guest.json()

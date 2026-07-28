@@ -193,12 +193,12 @@ async def auth_middleware(request: Request, call_next):
     cookie = request.cookies.get(SESSION_COOKIE_NAME, "")
     user_id = resolve_session_user_id(cookie) if cookie else None
     if user_id is None:
-        deny: Response = (
+        unauth: Response = (
             JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
             if path.startswith("/api/")
             else RedirectResponse("/login", status_code=302)
         )
-        return deny
+        return unauth
     request.state.user_id = user_id
     request.state.is_guest = user_id == GUEST_USER_ID
     if request.state.is_guest:

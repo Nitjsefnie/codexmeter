@@ -16,7 +16,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, Response
 
-from backend import api, db, events, ingest, login, session
+from backend import api, api_dashboard, api_sessions, db, events, ingest, login, session
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -94,6 +94,8 @@ app.add_middleware(_SelectiveGZip, minimum_size=1024)
 app.middleware("http")(session.auth_middleware)
 app.include_router(login.router)
 app.include_router(api.router)
+app.include_router(api_dashboard.router)
+app.include_router(api_sessions.router)
 
 
 @app.get("/health")

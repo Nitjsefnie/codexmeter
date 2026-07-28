@@ -27,7 +27,7 @@ from typing import NamedTuple
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from backend import api, cache, db, events, parse, r2
+from backend import api, api_dashboard, cache, db, events, parse, r2
 
 log = logging.getLogger("kimimeter.ingest")
 
@@ -602,16 +602,16 @@ def warm_common() -> None:
     # ("1d" matters most: its 5-minute buckets are below the rollups' 1h
     # gate, so it is the only range still served by live queries.)
     for rng in WARM_RANGES:
-        cache.warm(api.dashboard, range=rng)
-        cache.warm(api.activity_heatmap, range=rng)
-        cache.warm(api.tool_usage, range=rng)
-        cache.warm(api.tool_error_rate, range=rng)
-        cache.warm(api.reply_latency, range=rng)
+        cache.warm(api_dashboard.dashboard, range_=rng)
+        cache.warm(api.activity_heatmap, range_=rng)
+        cache.warm(api.tool_usage, range_=rng)
+        cache.warm(api.tool_error_rate, range_=rng)
+        cache.warm(api.reply_latency, range_=rng)
         # /api/projects is range-scoped, so it needs warming per range like
         # everything else. Warming it bare took the endpoint's own
         # signature default ("30d") while the UI opens on "all", leaving
         # the one request every page load makes permanently uncached.
-        cache.warm(api.list_projects, range=rng)
+        cache.warm(api.list_projects, range_=rng)
     log.info("warm_common: queued %d range(s)", len(WARM_RANGES))
 
 
