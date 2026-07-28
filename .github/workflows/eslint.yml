@@ -9,7 +9,10 @@ name: eslint
 # sourceType "script", env browser, and a globals list derived from
 # public/index.html (React/ReactDOM CDN scripts, BACKEND_URL) plus every
 # name the src files attach to window (window.X = ... and the
-# Object.assign(window, {...}) block in event-helpers.jsx).
+# Object.assign(window, {...}) block in event-helpers.jsx) plus every
+# top-level `function` declaration in src/**/*.js{,x} — in classic
+# scripts those become globals reachable across <script> tags without a
+# window.X = assignment (e.g. monoAdvancePx).
 #
 # The value here is no-undef / no-unused-vars — an undefined variable in
 # a component should be found by CI, not by a user. Stylistic rules stay
