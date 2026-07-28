@@ -495,10 +495,19 @@ function _parseKimiCode(blob) {
           if (p.type === "text") events.push({ type: "assistant_text", ts, line: lineNum, detail: String(p.text || "") });
           else if (p.type === "think") events.push({ type: "thinking", ts, line: lineNum, detail: String(p.think || "") });
         }
-        for (const tc of (msg.toolCalls || [])) {
-          const { name, args, id } = _kcParseToolCall(tc);
+        const msgToolCalls = msg.toolCalls || [];
+        for (let tcIdx = 0; tcIdx < msgToolCalls.length; tcIdx++) {
+          const { name, args, id } = _kcParseToolCall(msgToolCalls[tcIdx]);
           const toolInput = _kcArgsToInput(args);
-          events.push({ type: "tool_call", ts, line: lineNum, tool_name: name, tool_input: toolInput, tool_call_id: id, detail: "" });
+          const callEvent = { type: "tool_call", ts, line: lineNum, tool_name: name, tool_input: toolInput, tool_call_id: id, detail: "" };
+          // The wire's parallel-call representation: one assistant message
+          // carrying several toolCalls. Annotate so the timeline badge and
+          // computeSessionStats' parallel-batches count see real data.
+          if (msgToolCalls.length > 1) {
+            callEvent.batch_size = msgToolCalls.length;
+            callEvent.batch_index = tcIdx + 1;
+          }
+          events.push(callEvent);
           toolUses.push({
             file_key: "", line_num: lineNum, idx: toolUses.length,
             ts: ts, tool_name: name, tool_call_id: id, is_error: null,
@@ -763,6 +772,100 @@ window.computeStats = function computeStats(events, metaEvents) {
   }
 
   return lines.filter(Boolean).join("\n");
+};
+
+// Per-call context-window input, kimimeter shape: a status_update's
+// token_usage. Claudit's version summed input_tokens + cache_creation +
+// cache_read and took the peak across usage.iterations (sub-agent fan-out);
+// kimimeter's wire format has no iterations concept anywhere, so there is
+// no peak branch here. Defensive: a missing or non-numeric field
+// contributes 0, never NaN.
+window.usageCtxInput = function usageCtxInput(u) {
+  if (!u || typeof u !== "object") return 0;
+  const num = (v) => (typeof v === "number" && isFinite(v) ? v : 0);
+  return num(u.input_other) + num(u.input_cache_creation) + num(u.input_cache_read);
+};
+
+// SessionHeader's stats, as an OBJECT — NOT the human-readable string
+// computeStats above returns; the two serve different consumers and
+// computeStats' behaviour is unchanged. Ported from claudit's
+// computeSessionStats onto kimimeter's parsed shapes: claudit read
+// meta type "assistant_usage" with usage.{input,cache_creation,cache_read,
+// output}_tokens; kimimeter's parser emits type "status_update" with
+// token_usage.{input_other,input_cache_creation,input_cache_read,output}
+// plus a wire_model, and event timestamps in epoch seconds (or ISO
+// strings for legacy), which parseTimestamp normalises.
+window.computeSessionStats = function computeSessionStats(events, metaEvents) {
+  events = events || [];
+  metaEvents = metaEvents || [];
+  const stats = {
+    firstTs: null, lastTs: null,  // epoch ms; SessionHeader derives duration
+    turns: 0,
+    userMsgs: 0,
+    toolCalls: 0, toolResults: 0, errorResults: 0,
+    parallelBatches: 0, parallelCalls: 0,
+    toolCounts: {},
+    fresh: 0, create: 0, read: 0, output: 0,
+    totalInput: 0, hitRate: 0, cost: 0,
+  };
+
+  // Per-record model fallback for a status_update with no timestamp of its
+  // own — same rule as the record builders above.
+  let firstEventTs = null;
+
+  for (const e of events) {
+    const dt = parseTimestamp(e.ts);
+    if (dt) {
+      const t = dt.getTime();
+      if (stats.firstTs == null || t < stats.firstTs) stats.firstTs = t;
+      if (stats.lastTs == null || t > stats.lastTs) stats.lastTs = t;
+      if (firstEventTs == null) firstEventTs = e.ts;
+    }
+    if (e.type === "tool_call" || e.type === "agent_spawn") {
+      stats.toolCalls++;
+      const name = e.tool_name || "";
+      stats.toolCounts[name] = (stats.toolCounts[name] || 0) + 1;
+    } else if (e.type === "user_message") {
+      stats.userMsgs++;
+    } else if (e.type === "tool_result") {
+      stats.toolResults++;
+      if (e.is_error) stats.errorResults++;
+    }
+    if (e.batch_size > 1 && e.batch_index === 1) {
+      stats.parallelBatches++;
+      stats.parallelCalls += e.batch_size;
+    }
+  }
+
+  for (const m of metaEvents) {
+    if (m.type !== "status_update") continue;
+    const tu = m.token_usage;
+    if (!tu) continue;
+    stats.turns++;
+    const fresh = tu.input_other || 0;
+    const create = tu.input_cache_creation || 0;
+    const read = tu.input_cache_read || 0;
+    const output = tu.output || 0;
+    stats.fresh += fresh;
+    stats.create += create;
+    stats.read += read;
+    stats.output += output;
+    // Per-record model and rates, exactly as the record builders and
+    // computeCache: a session can span a cutoff or switch model mid-flight,
+    // so one session-wide rate would misprice part of it.
+    const model = modelFor(m.wire_model, m.ts != null ? m.ts : firstEventTs);
+    const r = window.rateForModel(model);
+    stats.cost += (
+      fresh * r.fresh / 1e6 +
+      create * r.create / 1e6 +
+      read * r.read / 1e6 +
+      output * r.output / 1e6
+    );
+  }
+
+  stats.totalInput = stats.fresh + stats.create + stats.read;
+  stats.hitRate = stats.totalInput ? (stats.read / stats.totalInput) * 100 : 0;
+  return stats;
 };
 
 window.computeCache = function computeCache(metaEvents, firstEventTs) {
