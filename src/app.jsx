@@ -209,7 +209,7 @@ function App() {
     const reader = new FileReader();
     reader.onload = e => {
       const text = String(e.target.result || '');
-      const { events, meta } = window.parseTranscript(text);
+      const { events, meta_events: meta } = window.parseTranscript(text);
       const stats = window.computeSessionStats(events, meta);
       setTx({ events, meta, stats });
       setFilename(file.name);
@@ -269,7 +269,7 @@ function App() {
       const file = arr[idx];
       const text = await readText(file);
       const before = seenUuids.size;
-      const { events, meta } = window.parseTranscript(text, { seenUuids });
+      const { events, meta_events: meta } = window.parseTranscript(text, { seenUuids });
       const after = seenUuids.size;
       // Rough estimate: lines that ran through parse minus uniques added.
       // Not exact, but useful for the status pill.
@@ -310,7 +310,7 @@ function App() {
     try {
       const r = await fetch(`/api/sessions/${sessionId}/transcript`, { credentials: 'same-origin' });
       const text = await r.text();
-      const { events, meta } = window.parseTranscript(text);
+      const { events, meta_events: meta } = window.parseTranscript(text);
       const stats = window.computeSessionStats(events, meta);
       setTx({ events, meta, stats });
       setFilename(sessionId);
