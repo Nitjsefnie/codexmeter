@@ -256,13 +256,13 @@ def test_warm_common_covers_every_warmed_range(fresh_db, mini_r2_env, monkeypatc
     "all", so the one request every page load makes was never warmed.
     """
     import time as _time
-    from backend import api, cache
+    from backend import api, api_dashboard, cache
 
     monkeypatch.setenv("KIMIMETER_WARM_CACHE", "1")
     ingest.run_ingest(trigger="manual")
 
     warmed = (
-        api.dashboard, api.activity_heatmap, api.tool_usage,
+        api_dashboard.dashboard, api.activity_heatmap, api.tool_usage,
         api.tool_error_rate, api.reply_latency, api.list_projects,
     )
     # The warms run on a background pool; give them a bounded moment.
