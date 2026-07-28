@@ -1,4 +1,3 @@
-import inspect
 import json
 import lzma
 import os
@@ -13,6 +12,7 @@ import pytest
 from botocore.exceptions import ConnectionClosedError
 
 from backend import api, api_dashboard, cache, db, ingest
+from backend.cache import _warm_kwargs
 from backend.ingest import _failure_summary
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -291,23 +291,13 @@ def test_warm_common_covers_every_warmed_range(fresh_db, mini_r2_env, monkeypatc
 def _warm_key(fn, rng: str) -> str:
     """Reproduce cache_response's key for a request at `rng`.
 
-    Built from the endpoint's own signature so it stays correct as params
-    are added — which is exactly what broke /api/projects.
+    The kwargs come from backend/cache.py's _warm_kwargs — the very
+    derivation warm() uses — so renaming an endpoint parameter cannot
+    desync what this probes from what warm() writes. Only the final key
+    formatting is reproduced here (issue #18).
     """
+    kwargs = _warm_kwargs(fn, range_=rng)
     target = getattr(fn, "__wrapped__", fn)
-    kwargs = {}
-    for name, param in inspect.signature(target).parameters.items():
-        default = param.default
-        kwargs[name] = getattr(default, "default", default)
-    # Mirrors backend/cache.py:216's key formula and warm()'s signature
-    # introspection (backend/cache.py's `warm`) — the override key MUST be
-    # the endpoint's actual parameter name, not its query-string alias.
-    # That name is `range_` (Query(alias="range")); if a future rename
-    # moves it again, this line has to move with it or _warm_key silently
-    # starts probing a key nothing ever writes.
-    kwargs["range_"] = rng
-    if "fresh" in kwargs:
-        kwargs["fresh"] = 0
     return target.__qualname__ + ":" + repr(sorted(kwargs.items()))
 
 

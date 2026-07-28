@@ -153,6 +153,28 @@ def _schedule_refresh(key: str, fn: Callable[..., dict], kwargs: dict[str, Any])
     _refresh_pool.submit(_run)
 
 
+def _warm_kwargs(fn: Callable[..., dict], **overrides: Any) -> dict[str, Any]:
+    """Assemble the kwargs ``warm()`` calls the cached wrapper with.
+
+    Module-level on purpose: tests/test_ingest.py's ``_warm_key`` imports
+    this same derivation so the key it probes is always the key ``warm()``
+    writes. A second copy of this loop is what let the ``range`` ->
+    ``range_`` rename desync the test from production (issue #18).
+    """
+    target = getattr(fn, "__wrapped__", fn)
+    kwargs: dict[str, Any] = {}
+    for name, param in inspect.signature(target).parameters.items():
+        default = param.default
+        # Query(...) defaults carry the real value on `.default`.
+        kwargs[name] = getattr(default, "default", default)
+    kwargs.update(overrides)
+    if "fresh" in kwargs:
+        # A truthy `fresh` bypasses the cache on both read and write, so
+        # warming with it would compute the response and store nothing.
+        kwargs["fresh"] = 0
+    return kwargs
+
+
 def warm(fn: Callable[..., dict], **overrides: Any) -> None:
     """Populate the cache entry a request with `overrides` would produce.
 
@@ -167,17 +189,7 @@ def warm(fn: Callable[..., dict], **overrides: Any) -> None:
     So start from the endpoint's own defaults and apply the overrides on
     top; guessing the kwargs would warm a key nobody ever reads.
     """
-    target = getattr(fn, "__wrapped__", fn)
-    kwargs: dict[str, Any] = {}
-    for name, param in inspect.signature(target).parameters.items():
-        default = param.default
-        # Query(...) defaults carry the real value on `.default`.
-        kwargs[name] = getattr(default, "default", default)
-    kwargs.update(overrides)
-    if "fresh" in kwargs:
-        # A truthy `fresh` bypasses the cache on both read and write, so
-        # warming with it would compute the response and store nothing.
-        kwargs["fresh"] = 0
+    kwargs = _warm_kwargs(fn, **overrides)
 
     def _run() -> None:
         try:
