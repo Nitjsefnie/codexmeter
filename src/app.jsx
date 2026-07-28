@@ -13,11 +13,13 @@ function txToDashData(tx) {
   const rateFor = window.rateForModel;
   const shortM = (model) => window.shortModelName(model || 'kimi');
 
-  // Group all assistant_usage records by sessionId, plus user-text events
-  // per session for turn boundaries (only available when loaded via Load N).
+  // Group all usage records (status_update metas, normalised through
+  // window.asUsageRecord) by sessionId, plus user-text events per session
+  // for turn boundaries (only available when loaded via Load N).
   const usageBySid = new Map();
-  for (const u of tx.meta) {
-    if (u.type !== 'assistant_usage') continue;
+  for (const m of tx.meta) {
+    const u = window.asUsageRecord(m);
+    if (!u) continue;
     const sid = u.sessionId || 'live';
     if (!usageBySid.has(sid)) usageBySid.set(sid, []);
     usageBySid.get(sid).push(u);
@@ -74,24 +76,23 @@ function txToDashData(tx) {
     const turnUsages = bounds.length ? turns.map(t => t[t.length - 1]) : usages;
     let turnIdx = 0;
     for (const u of turnUsages) {
-      const t = Date.parse(u.ts); if (isNaN(t)) continue;
-      const us = u.usage || {};
-      const inp = us.input_tokens || 0;
-      const out = us.output_tokens || 0;
-      const cr  = us.cache_read_input_tokens || 0;
-      if ((inp + cr) === 0) continue; // refusal/interrupt
+      if (u.tsMs == null) continue;
+      if (u.ctx === 0) continue; // refusal/interrupt
       const r = rateFor(u.model);
-      const cost = (inp * r.fresh + out * r.out + cr * r.read) / 1_000_000;
+      // All four buckets priced — create included, matching
+      // computeSessionStats so this path and the Inspector never disagree.
+      const cost = (u.input * r.fresh + u.create * r.create
+                  + u.read * r.read + u.output * r.out) / 1_000_000;
       events.push({
-        ts: t,
+        ts: u.tsMs,
         session_id: sid,
         turn_index: turnIdx++,
         model: shortM(u.model),
-        input_tokens: inp,
-        output_tokens: out,
-        cache_read: cr,
+        input_tokens: u.input,
+        output_tokens: u.output,
+        cache_read: u.read,
         cost_usd: cost,
-        ctx: window.usageCtxInput(us),
+        ctx: u.ctx,
       });
     }
   }
@@ -219,7 +220,7 @@ function App() {
     reader.readAsText(file);
   }
 
-  // Load N .jsonl files at once: union all assistant_usage and rate_limit
+  // Load N .jsonl files at once: union all status_update and rate_limit
   // metas into a single tx-shaped object so the dashboard sees real
   // multi-session data. The Inspector still works on the FIRST file's
   // events, but Overview / Sessions get the merged view.
@@ -276,14 +277,13 @@ function App() {
       dupedRecs += Math.max(0, (text.split('\n').length - 1) - (after - before)) - meta.length;
       if (idx === 0) firstParsed = { events, meta, name: file.name };
       const fallbackSid = file.name.replace(/\.jsonl$/, '');
-      // Resolve a sessionId for this file: prefer sessionId on usage records,
-      // fall back to filename. One file ≈ one logical session in CC.
-      let sid = fallbackSid;
+      // Session-id resolution: the parser never emits a sessionId on any
+      // record (one file ≈ one logical session), so the filename is the
+      // only source. Tag this file's usage records with it so txToDashData
+      // can group the merged metas back into per-session buckets.
+      const sid = fallbackSid;
       for (const m of meta) {
-        if (m.type === 'assistant_usage' && m.sessionId) { sid = m.sessionId; break; }
-      }
-      for (const m of meta) {
-        if (m.type === 'assistant_usage' && !m.sessionId) m.sessionId = sid;
+        if (window.asUsageRecord(m) && !m.sessionId) m.sessionId = sid;
         all.meta.push(m);
       }
       // Stash this file's events under its session for turn analysis.

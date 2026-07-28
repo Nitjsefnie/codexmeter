@@ -3,16 +3,17 @@
 //   1. Walk events chronologically.
 //   2. User text messages with non-empty text content are turn boundaries.
 //      (User messages that are tool_result-only don't count.)
-//   3. For each turn, take the LAST assistant_usage record before the
-//      next boundary as that turn's context size = input + cache_read.
-//   4. Drop turns where input == 0 (API refusals / interrupts).
+//   3. For each turn, take the LAST usage record before the
+//      next boundary as that turn's context size (its ctx, per
+//      window.usageCtxInput).
+//   4. Drop turns where ctx == 0 (API refusals / interrupts).
 //
 // Renders: a sparkline-style chart of input over turns, plus a dense table.
 
 function computeTurnStats(tx) {
   const allLines = [];
   // Build a single line-ordered list of {kind, line, ts, ...} events.
-  // We need user text boundaries AND assistant_usage records, sorted by line.
+  // We need user text boundaries AND usage records, sorted by line.
   for (const e of tx.events) {
     if (e.type === 'user_message' && typeof e.detail === 'string' && e.detail.trim()) {
       // Skip likely tool_result-passthrough wrappers — those come through
@@ -22,13 +23,14 @@ function computeTurnStats(tx) {
     }
   }
   for (const m of tx.meta) {
-    if (m.type === 'assistant_usage') {
+    const u = window.asUsageRecord(m);
+    if (u) {
       allLines.push({
         kind: 'usage',
-        line: m.line,
-        ts: m.ts,
-        usage: m.usage,
-        model: m.model,
+        line: u.line,
+        ts: u.ts,
+        usage: u,
+        model: u.model,
       });
     }
   }
@@ -47,31 +49,27 @@ function computeTurnStats(tx) {
   }
   if (cur && cur.usages.length) turns.push(cur);
 
-  // Reduce each turn to its LAST usage; compute context = input + cc + cr.
+  // Reduce each turn to its LAST usage; the context is its normalised ctx.
   const rows = [];
   let prevInput = null;
   for (let i = 0; i < turns.length; i++) {
     const t = turns[i];
     const last = t.usages[t.usages.length - 1];
-    const u = last.usage || {};
-    const inp = u.input_tokens || 0;
-    const cr = u.cache_read_input_tokens || 0;
-    const out = u.output_tokens || 0;
-    const ctx = window.usageCtxInput(u);
-    if (ctx === 0) continue; // refusal / interrupt
-    const delta = prevInput !== null ? ctx - prevInput : null;
+    const u = last.usage;
+    if (u.ctx === 0) continue; // refusal / interrupt
+    const delta = prevInput !== null ? u.ctx - prevInput : null;
     rows.push({
       turnNum: rows.length + 1,
       line: last.line,
       ts: last.ts,
       model: last.model,
-      input: inp,
-      cacheRead: cr,
-      output: out,
-      ctx,
+      input: u.input,
+      cacheRead: u.read,
+      output: u.output,
+      ctx: u.ctx,
       delta,
     });
-    prevInput = ctx;
+    prevInput = u.ctx;
   }
   return rows;
 }

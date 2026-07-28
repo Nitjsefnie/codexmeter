@@ -786,6 +786,42 @@ window.usageCtxInput = function usageCtxInput(u) {
   return num(u.input_other) + num(u.input_cache_creation) + num(u.input_cache_read);
 };
 
+// The ONE selector that decides "is this meta record a usage record, and
+// what are its numbers". This parser emits type "status_update" with
+// token_usage.{input_other,input_cache_creation,input_cache_read,output}
+// plus a wire_model; claudit consumers read type "assistant_usage" with
+// usage.*_tokens, a shape this parser never emits. Every consumer —
+// computeSessionStats below, the Inspector's computeTurnStats, and
+// app.jsx's txToDashData / loadFiles — goes through this helper so the
+// record shape is derived in exactly one place and cannot drift again.
+// Returns null for anything that is not a usage record.
+//
+// Numbers are defensive (same rule as usageCtxInput): a missing or
+// non-numeric bucket contributes 0, never NaN. `model` is resolved
+// per-record through modelFor — wire_model first, then the date ladder,
+// with `fallbackTs` (the session's first event ts) for records carrying no
+// timestamp of their own. `tsMs` is the record's timestamp in epoch ms for
+// dashboard consumers. `sessionId` is a passthrough: the parser never sets
+// it (one file ≈ one session); app.jsx's multi-file merge tags it.
+window.asUsageRecord = function asUsageRecord(m, fallbackTs) {
+  if (!m || m.type !== "status_update" || !m.token_usage) return null;
+  const num = (v) => (typeof v === "number" && isFinite(v) ? v : 0);
+  const tu = m.token_usage;
+  const dt = parseTimestamp(m.ts);
+  return {
+    line: m.line,
+    ts: m.ts,
+    tsMs: dt ? dt.getTime() : null,
+    sessionId: m.sessionId,
+    model: modelFor(m.wire_model, m.ts != null ? m.ts : fallbackTs),
+    input: num(tu.input_other),
+    create: num(tu.input_cache_creation),
+    read: num(tu.input_cache_read),
+    output: num(tu.output),
+    ctx: window.usageCtxInput(tu),
+  };
+};
+
 // SessionHeader's stats, as an OBJECT — NOT the human-readable string
 // computeStats above returns; the two serve different consumers and
 // computeStats' behaviour is unchanged. Ported from claudit's
@@ -794,7 +830,8 @@ window.usageCtxInput = function usageCtxInput(u) {
 // output}_tokens; kimimeter's parser emits type "status_update" with
 // token_usage.{input_other,input_cache_creation,input_cache_read,output}
 // plus a wire_model, and event timestamps in epoch seconds (or ISO
-// strings for legacy), which parseTimestamp normalises.
+// strings for legacy), which parseTimestamp normalises. Usage records are
+// selected and normalised through window.asUsageRecord.
 window.computeSessionStats = function computeSessionStats(events, metaEvents) {
   events = events || [];
   metaEvents = metaEvents || [];
@@ -838,28 +875,23 @@ window.computeSessionStats = function computeSessionStats(events, metaEvents) {
   }
 
   for (const m of metaEvents) {
-    if (m.type !== "status_update") continue;
-    const tu = m.token_usage;
-    if (!tu) continue;
+    const u = window.asUsageRecord(m, firstEventTs);
+    if (!u) continue;
     stats.turns++;
-    const fresh = tu.input_other || 0;
-    const create = tu.input_cache_creation || 0;
-    const read = tu.input_cache_read || 0;
-    const output = tu.output || 0;
-    stats.fresh += fresh;
-    stats.create += create;
-    stats.read += read;
-    stats.output += output;
-    // Per-record model and rates, exactly as the record builders and
-    // computeCache: a session can span a cutoff or switch model mid-flight,
-    // so one session-wide rate would misprice part of it.
-    const model = modelFor(m.wire_model, m.ts != null ? m.ts : firstEventTs);
-    const r = window.rateForModel(model);
+    stats.fresh += u.input;
+    stats.create += u.create;
+    stats.read += u.read;
+    stats.output += u.output;
+    // Per-record rates (the model was resolved inside asUsageRecord),
+    // exactly as the record builders and computeCache: a session can span a
+    // cutoff or switch model mid-flight, so one session-wide rate would
+    // misprice part of it.
+    const r = window.rateForModel(u.model);
     stats.cost += (
-      fresh * r.fresh / 1e6 +
-      create * r.create / 1e6 +
-      read * r.read / 1e6 +
-      output * r.output / 1e6
+      u.input * r.fresh / 1e6 +
+      u.create * r.create / 1e6 +
+      u.read * r.read / 1e6 +
+      u.output * r.output / 1e6
     );
   }
 
