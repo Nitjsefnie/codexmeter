@@ -5,10 +5,17 @@
 ## Repo orientation
 
 - `backend/` — FastAPI app.
-  - `app.py` — startup/shutdown, route mounting, `/` static, asset cache-bust.
-  - `api.py` — REST endpoints (`/api/me`, `/api/projects`, `/api/dashboard`,
-    `/api/cache`, `/api/context-growth/{agg,session}`, `/api/sessions*`,
-    `/api/events` SSE).
+  - `app.py` — startup/shutdown, route mounting (login + api +
+    api_dashboard + api_sessions), `/` static, asset cache-bust.
+  - `api.py` — shared query helpers (_proj_*, _parse_range,
+    _bucket_seconds, Phases, _iso) plus the tool/activity/latency/
+    models/projects/cache endpoints (`/api/me`, `/api/tool-usage`,
+    `/api/tool-error-rate`, `/api/activity-heatmap`, `/api/reply-latency`,
+    `/api/models`, `/api/projects`, `/api/cache`, `/api/events` SSE).
+  - `api_dashboard.py` — `/api/dashboard`, split out of api.py
+    (_DashQuery/_DashRows pipeline).
+  - `api_sessions.py` — `/api/sessions*`, `/api/context-growth/{agg,session}`,
+    split out of api.py.
   - `parse.py` — wire.jsonl → records + ctx_turns. Mirrors
     the canonical `~/.kimi-code/scripts/parse_wire.py` for turn-based
     StatusUpdate extraction.
@@ -23,6 +30,9 @@
   - `events.py` — thread-safe SSE broadcaster.
   - `db.py` — two psycopg pools: `viz_pool` (kimimeter) and `auth_pool`
     (read-only auth DB). Pools never join across DBs.
+    `close_viz_pool()` is the test-teardown hook that drops the cached
+    viz pool after repointing DATABASE_URL_VIZ. `sql_literal()` marks
+    trusted f-string SQL for psycopg's LiteralString-typed execute().
   - `cache.py` — in-memory LRU for raw transcript bytes.
   - `schema.sql` — idempotent `CREATE TABLE IF NOT EXISTS` + safe
     `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migrations.
@@ -42,7 +52,10 @@
   - `views/` — `cache-view.jsx`, `context-growth-view-v2.jsx`.
 
 - `scripts/` — symlinks to canonical `~/.kimi-code/scripts/*.py`. **Read-only**;
-  the web app does NOT invoke them at runtime.
+  the web app does NOT invoke them at runtime. `scripts/plots/` holds real
+  files: `ccusage_plot.py` (directly-executable main) split into
+  `ccusage_common.py` (theme/helpers) and `ccusage_burn.py` (burn panel) —
+  plain sibling imports keep `python ccusage_plot.py` working.
 
 - `tests/` — pytest suite.
 
