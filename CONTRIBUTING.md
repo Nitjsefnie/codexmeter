@@ -117,10 +117,10 @@ know a reparse is coming.
 
 ## Licensing
 
-kimimeter is MIT (see [`LICENSE`](LICENSE)). It incorporates portions of
-`nhz-io/ccusage-plot`, whose notice is reproduced in
-[`NOTICE`](NOTICE) — keep third-party notices in that file rather than
-appending them to `LICENSE`, which makes GitHub misclassify the project.
+kimimeter is MIT (see [`LICENSE`](LICENSE)). If a future change vendors
+third-party code, reproduce its notice in a separate `NOTICE` file rather
+than appending it to `LICENSE`, which makes GitHub misclassify the
+project.
 
 ## Pull requests
 

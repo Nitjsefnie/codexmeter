@@ -52,10 +52,7 @@
   - `views/` — `cache-view.jsx`, `context-growth-view-v2.jsx`.
 
 - `scripts/` — symlinks to canonical `~/.kimi-code/scripts/*.py`. **Read-only**;
-  the web app does NOT invoke them at runtime. `scripts/plots/` holds real
-  files: `ccusage_plot.py` (directly-executable main) split into
-  `ccusage_common.py` (theme/helpers) and `ccusage_burn.py` (burn panel) —
-  plain sibling imports keep `python ccusage_plot.py` working.
+  the web app does NOT invoke them at runtime.
 
 - `tests/` — pytest suite.
 
