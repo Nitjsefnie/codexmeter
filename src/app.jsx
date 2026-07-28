@@ -251,16 +251,12 @@ function App() {
     }
     arr = expanded;
     if (!arr.length) return;
-    // Sequential parse with shared cross-file uuid dedup, mirroring
-    // parse_session.py's directory mode. The same API call recorded into
-    // two files (main + agent-*.jsonl) is processed once.
-    const seenUuids = new Set();
+    // Sequential parse, merging every file into one events/meta pool.
     const all = { events: [], meta: [] };
     // Per-session event arrays so we can compute true turn boundaries
     // (user-text → next user-text) for each session independently.
     const evBySession = new Map();
     let firstParsed = null;
-    let dupedRecs = 0;
     const readText = (file) => new Promise(resolve => {
       const r = new FileReader();
       r.onload = e => resolve(String(e.target.result || ''));
@@ -269,12 +265,7 @@ function App() {
     for (let idx = 0; idx < arr.length; idx++) {
       const file = arr[idx];
       const text = await readText(file);
-      const before = seenUuids.size;
-      const { events, meta_events: meta } = window.parseTranscript(text, { seenUuids });
-      const after = seenUuids.size;
-      // Rough estimate: lines that ran through parse minus uniques added.
-      // Not exact, but useful for the status pill.
-      dupedRecs += Math.max(0, (text.split('\n').length - 1) - (after - before)) - meta.length;
+      const { events, meta_events: meta } = window.parseTranscript(text);
       if (idx === 0) firstParsed = { events, meta, name: file.name };
       const fallbackSid = file.name.replace(/\.jsonl$/, '');
       // Session-id resolution: the parser never emits a sessionId on any
@@ -301,7 +292,7 @@ function App() {
       stats,
       eventsBySession: evBySession,
     });
-    setFilename(`${arr.length} files merged · ${seenUuids.size.toLocaleString()} uniq recs`);
+    setFilename(`${arr.length} files merged`);
     setUseSynth(false);
     setRoute('dashboard');
   }
@@ -1014,7 +1005,7 @@ function SessionView({ tx, loadFile, loadFiles }) {
       if (!files || !files.length) return;
       const isZip = files[0].name.toLowerCase().endsWith('.zip');
       // Single transcript → inspector; several files or a zip → the
-      // multi-file merge path (cross-file uuid dedup → dashboard).
+      // multi-file merge path (merged pool → dashboard).
       if (files.length === 1 && !isZip) loadFile(files[0]);
       else loadFiles(files);
     };
