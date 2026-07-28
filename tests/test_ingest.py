@@ -296,7 +296,13 @@ def _warm_key(fn, rng: str) -> str:
     for name, param in inspect.signature(target).parameters.items():
         default = param.default
         kwargs[name] = getattr(default, "default", default)
-    kwargs["range"] = rng
+    # Mirrors backend/cache.py:216's key formula and warm()'s signature
+    # introspection (backend/cache.py's `warm`) — the override key MUST be
+    # the endpoint's actual parameter name, not its query-string alias.
+    # That name is `range_` (Query(alias="range")); if a future rename
+    # moves it again, this line has to move with it or _warm_key silently
+    # starts probing a key nothing ever writes.
+    kwargs["range_"] = rng
     if "fresh" in kwargs:
         kwargs["fresh"] = 0
     return target.__qualname__ + ":" + repr(sorted(kwargs.items()))
