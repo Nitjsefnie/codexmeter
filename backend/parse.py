@@ -11,8 +11,8 @@ bump to invalidate every files row.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Iterable
 
 import orjson
 
@@ -38,10 +38,12 @@ from backend import pricing
 #
 # Boundaries are strictly-before / inclusive-at, so each cutoff instant
 # belongs to the NEWER model.
-MODEL_CUTOFF_EPOCH = 1781217035   # 2026-06-11 22:30:35 UTC  k2-6 -> k2-7-code
-K3_CUTOFF_EPOCH = 1784213155      # 2026-07-16 14:45:55 UTC  earliest observed
-                                  # k3 usage.record; only applies to records
-                                  # with no wire model string.
+
+# 2026-06-11 22:30:35 UTC  k2-6 -> k2-7-code
+MODEL_CUTOFF_EPOCH = 1781217035
+# 2026-07-16 14:45:55 UTC  earliest observed k3 usage.record; only applies
+# to records with no wire model string.
+K3_CUTOFF_EPOCH = 1784213155
 MODEL_CUTOFF_DT = datetime.fromtimestamp(MODEL_CUTOFF_EPOCH, tz=timezone.utc)
 K3_CUTOFF_DT = datetime.fromtimestamp(K3_CUTOFF_EPOCH, tz=timezone.utc)
 
@@ -111,188 +113,149 @@ def _to_dt(s: str | float | None):
         return None
 
 
-def _parse_legacy(file_key: str, blob: bytes) -> dict:
-    """Parse one legacy kimi-cli wire.jsonl.
+@dataclass
+class _ParseState:
+    """Mutable per-file parse state threaded through the message handlers.
 
-    records: list of dicts with keys
-      file_key, line_num, uuid, ts, model,
-      fresh_tokens, cache_creation_tokens, cache_read_tokens,
-      output_tokens, text_chars, reply_latency_s, cost_usd
-
-    ctx_turns: list of dicts with keys
-      idx, ts, line, input, output, delta
+    turns entries are {begin_line, begin_ts, end_line, end_ts,
+    status_lines: [line_num]}; records entries carry the keys documented
+    on parse_file plus an internal ctx_input used to build ctx_turns.
     """
-    records_in_order: list[dict] = []
-    tool_uses: list[dict] = []
-    rate_limit_hits: list[dict] = []
-
+    file_key: str
+    records: list[dict] = field(default_factory=list)
+    tool_uses: list[dict] = field(default_factory=list)
+    rate_limit_hits: list[dict] = field(default_factory=list)
     # Per-file map of tool_call_id -> bool(is_error)
-    tool_result_is_error: dict[str, bool] = {}
-
-    # Turn tracking
-    turns: list[dict] = []  # {begin_line, begin_ts, end_line, end_ts, status_lines: [line_num]}
+    tool_result_is_error: dict[str, bool] = field(default_factory=dict)
+    turns: list[dict] = field(default_factory=list)
     current_turn: dict | None = None
-
+    current_turn_id: str | None = None
     # For reply latency: track TurnBegin ts, then find first assistant event
     pending_turn_begin_ts: datetime | None = None
-    pending_turn_begin_line: int = 0
     turn_has_assistant_event: bool = False
-
     # For text_chars: accumulate ContentPart.text since last TurnBegin
     text_chars_since_turn: int = 0
-
     # First event timestamp drives the per-session model label.
     first_event_ts: datetime | None = None
 
-    for line_num, raw in enumerate(blob.splitlines(), 1):
-        if not raw:
-            continue
-        try:
-            obj = orjson.loads(raw)
-        except orjson.JSONDecodeError:
-            continue
 
-        ts_raw = obj.get("timestamp")
-        msg = obj.get("message") or {}
-        msg_type = msg.get("type", "")
-        payload = msg.get("payload", {})
-        ts_dt = _to_dt(ts_raw)
-        if ts_dt is not None and first_event_ts is None:
-            first_event_ts = ts_dt
+def _close_turn(st: _ParseState, line_num: int, ts: datetime | None) -> None:
+    if st.current_turn is not None:
+        st.current_turn["end_line"] = line_num
+        st.current_turn["end_ts"] = ts
+        st.turns.append(st.current_turn)
+        st.current_turn = None
 
-        if msg_type == "TurnBegin":
-            # Close previous turn if open
-            if current_turn is not None:
-                turns.append(current_turn)
-            current_turn = {
-                "begin_line": line_num,
-                "begin_ts": ts_dt,
-                "end_line": None,
-                "end_ts": None,
-                "status_lines": [],
-            }
-            pending_turn_begin_ts = ts_dt
-            pending_turn_begin_line = line_num
-            turn_has_assistant_event = False
-            text_chars_since_turn = 0
-            continue
 
-        if msg_type == "TurnEnd" and current_turn is not None:
-            current_turn["end_line"] = line_num
-            current_turn["end_ts"] = ts_dt
-            turns.append(current_turn)
-            current_turn = None
-            pending_turn_begin_ts = None
-            continue
+def _start_turn(st: _ParseState, line_num: int, ts: datetime | None) -> None:
+    st.current_turn = {
+        "begin_line": line_num,
+        "begin_ts": ts,
+        "end_line": None,
+        "end_ts": None,
+        "status_lines": [],
+    }
+    st.turn_has_assistant_event = False
+    st.text_chars_since_turn = 0
 
-        if msg_type == "ContentPart":
-            part_type = payload.get("type", "")
-            if part_type == "text":
-                text_chars_since_turn += len(str(payload.get("text", "")))
-            # Any ContentPart or ToolCall counts as an assistant event
-            if not turn_has_assistant_event and pending_turn_begin_ts is not None:
-                turn_has_assistant_event = True
-            continue
 
-        if msg_type == "ToolCall":
-            func = payload.get("function", {})
-            tool_name = func.get("name", "")
-            tool_call_id = payload.get("id", "")
-            tool_uses.append({
-                "file_key": file_key,
-                "line_num": line_num,
-                "idx": len(tool_uses),
-                "ts": ts_dt,
-                "tool_name": tool_name,
-                "tool_call_id": tool_call_id,
-                "is_error": None,
-            })
-            if not turn_has_assistant_event and pending_turn_begin_ts is not None:
-                turn_has_assistant_event = True
-            continue
+def _turn_boundary(st: _ParseState, line_num: int, ts: datetime | None) -> None:
+    """Close any open turn, open the next, and arm the reply-latency anchor."""
+    _close_turn(st, line_num, ts)
+    _start_turn(st, line_num, ts)
+    st.pending_turn_begin_ts = ts
 
-        if msg_type == "ToolResult":
-            return_value = payload.get("return_value", {})
-            tc_id = payload.get("tool_call_id", "")
-            is_err = False
-            if isinstance(return_value, dict):
-                is_err = bool(return_value.get("is_error", False))
-            if tc_id:
-                tool_result_is_error[str(tc_id)] = is_err
-            continue
 
-        if msg_type == "StatusUpdate":
-            tu = payload.get("token_usage")
-            if not tu:
-                continue
+def _mark_assistant_event(st: _ParseState) -> None:
+    if not st.turn_has_assistant_event and st.pending_turn_begin_ts is not None:
+        st.turn_has_assistant_event = True
 
-            fresh = int(tu.get("input_other", 0) or 0)
-            create = int(tu.get("input_cache_creation", 0) or 0)
-            read = int(tu.get("input_cache_read", 0) or 0)
-            output = int(tu.get("output", 0) or 0)
-            total_input = fresh + create + read
 
-            # Reply latency: gap from TurnBegin to first assistant event
-            reply_latency_s: float | None = None
-            if pending_turn_begin_ts is not None and ts_dt is not None:
-                delta_s = (ts_dt - pending_turn_begin_ts).total_seconds()
-                if delta_s >= 0:
-                    reply_latency_s = delta_s
-            # Consume the anchor once we record a StatusUpdate for this turn
-            pending_turn_begin_ts = None
+def _consume_reply_latency(st: _ParseState, ts: datetime | None) -> float | None:
+    """Gap from the turn's anchor to this record, if the anchor is open.
 
-            # Legacy transcripts carry no model string anywhere — verified
-            # across the corpus: StatusUpdate payloads expose only
-            # context_usage / context_tokens / max_context_tokens /
-            # token_usage / message_id / plan_mode / mcp_status. Dates are all
-            # we have here. Use the RECORD's own ts so a session spanning a
-            # cutoff splits correctly; first_event_ts is only the fallback for
-            # a record with no timestamp of its own.
-            model = _model_for(None, ts_dt or first_event_ts)
-            cost = pricing.compute_cost(
-                model,
-                fresh=fresh, create=create, read=read, output=output,
-            )
+    The anchor is consumed either way: one reply latency per turn, taken
+    from its first billing record.
+    """
+    latency = None
+    if st.pending_turn_begin_ts is not None and ts is not None:
+        delta_s = (ts - st.pending_turn_begin_ts).total_seconds()
+        if delta_s >= 0:
+            latency = delta_s
+    st.pending_turn_begin_ts = None
+    return latency
 
-            records_in_order.append({
-                "file_key": file_key,
-                "line_num": line_num,
-                "uuid": payload.get("message_id") or None,
-                "ts": ts_dt,
-                "model": model,
-                "fresh_tokens": fresh,
-                "cache_creation_tokens": create,
-                "cache_read_tokens": read,
-                "output_tokens": output,
-                "cost_usd": round(cost, 6),
-                "text_chars": text_chars_since_turn,
-                "reply_latency_s": reply_latency_s,
-                "ctx_input": total_input,
-            })
 
-            if current_turn is not None:
-                current_turn["status_lines"].append(line_num)
-            continue
+def _append_tool_use(st: _ParseState, line_num: int, ts: datetime | None,
+                     tool_name: str, tool_call_id: str) -> None:
+    st.tool_uses.append({
+        "file_key": st.file_key,
+        "line_num": line_num,
+        "idx": len(st.tool_uses),
+        "ts": ts,
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "is_error": None,
+    })
 
-    # Close dangling turn
-    if current_turn is not None:
-        turns.append(current_turn)
 
-    # Resolve tool_result.is_error onto each tool_uses entry
+def _append_usage_record(st: _ParseState, line_num: int,
+                         ts: datetime | None, uuid: str | None,
+                         wire_model: str | None, toks: tuple[int, int, int, int]
+                         ) -> None:
+    """Build one billing record from its token counts and append it.
+
+    The model is resolved per-record (a session can switch model
+    mid-flight): the wire id wins when it settles the model
+    unambiguously, dates decide only what the wire cannot express.
+    first_event_ts is the fallback for a record with no timestamp of its
+    own.
+    """
+    fresh, create, read, output = toks
+    latency = _consume_reply_latency(st, ts)
+    model = _model_for(wire_model, ts or st.first_event_ts)
+    cost = pricing.compute_cost(
+        model,
+        fresh=fresh, create=create, read=read, output=output,
+    )
+    st.records.append({
+        "file_key": st.file_key,
+        "line_num": line_num,
+        "uuid": uuid,
+        "ts": ts,
+        "model": model,
+        "fresh_tokens": fresh,
+        "cache_creation_tokens": create,
+        "cache_read_tokens": read,
+        "output_tokens": output,
+        "cost_usd": round(cost, 6),
+        "text_chars": st.text_chars_since_turn,
+        "reply_latency_s": latency,
+        "ctx_input": fresh + create + read,
+    })
+    if st.current_turn is not None:
+        st.current_turn["status_lines"].append(line_num)
+
+
+def _resolve_tool_errors(tool_uses: list[dict],
+                         tool_result_is_error: dict[str, bool]) -> None:
+    """Resolve tool_result.is_error onto each tool_uses entry."""
     for tu in tool_uses:
         tc_id = tu.pop("tool_call_id", "")
         if tc_id and tc_id in tool_result_is_error:
             tu["is_error"] = tool_result_is_error[tc_id]
 
-    # Build ctx_turns from turns + records
-    # Map line_num -> record for quick lookup
-    rec_by_line = {r["line_num"]: r for r in records_in_order}
 
+def _ctx_turns_from_turns(turns: list[dict], records: list[dict]) -> list[dict]:
+    """Build ctx_turns from turns + records.
+
+    The last StatusUpdate/usage.record in each turn is the canonical one.
+    """
+    rec_by_line = {r["line_num"]: r for r in records}
     ctx_turns: list[dict] = []
     prev_input = 0
     turn_idx = 0
     for turn in turns:
-        # Use the last StatusUpdate in this turn as the canonical one
         if not turn["status_lines"]:
             continue
         last_line = turn["status_lines"][-1]
@@ -310,14 +273,138 @@ def _parse_legacy(file_key: str, blob: bytes) -> dict:
             "delta": ctx_input - prev_input,
         })
         prev_input = ctx_input
+    return ctx_turns
 
+
+def _finish_parse(st: _ParseState, end_line: int | None = None) -> dict:
+    """Shared tail for both formats: close any dangling turn, settle the
+    tool-call is_error flags, and build ctx_turns from the turns."""
+    if end_line is not None:
+        _close_turn(st, end_line, None)
+    elif st.current_turn is not None:
+        st.turns.append(st.current_turn)
+    _resolve_tool_errors(st.tool_uses, st.tool_result_is_error)
+    ctx_turns = _ctx_turns_from_turns(st.turns, st.records)
     return {
-        "records": records_in_order,
+        "records": st.records,
         "ctx_turns": ctx_turns,
         "turn_count": len(ctx_turns),
-        "rate_limit_hits": rate_limit_hits,
-        "tool_uses": tool_uses,
+        "rate_limit_hits": st.rate_limit_hits,
+        "tool_uses": st.tool_uses,
     }
+
+
+# --------------------------------------------------------------------------
+# Legacy kimi-cli format
+# --------------------------------------------------------------------------
+
+
+def _legacy_turn_end(st: _ParseState, line_num: int,
+                     ts: datetime | None) -> None:
+    if st.current_turn is not None:
+        _close_turn(st, line_num, ts)
+        st.pending_turn_begin_ts = None
+
+
+def _legacy_content_part(st: _ParseState, payload: dict) -> None:
+    if payload.get("type", "") == "text":
+        st.text_chars_since_turn += len(str(payload.get("text", "")))
+    # Any ContentPart or ToolCall counts as an assistant event
+    _mark_assistant_event(st)
+
+
+def _legacy_tool_call(st: _ParseState, line_num: int, ts: datetime | None,
+                      payload: dict) -> None:
+    func = payload.get("function", {})
+    _append_tool_use(
+        st, line_num, ts, func.get("name", ""), payload.get("id", "")
+    )
+    _mark_assistant_event(st)
+
+
+def _legacy_tool_result(st: _ParseState, payload: dict) -> None:
+    return_value = payload.get("return_value", {})
+    tc_id = payload.get("tool_call_id", "")
+    is_err = isinstance(return_value, dict) and bool(
+        return_value.get("is_error", False)
+    )
+    if tc_id:
+        st.tool_result_is_error[str(tc_id)] = is_err
+
+
+def _legacy_status_update(st: _ParseState, line_num: int,
+                          ts: datetime | None, payload: dict) -> None:
+    tu = payload.get("token_usage")
+    if not tu:
+        return
+    toks = (
+        int(tu.get("input_other", 0) or 0),
+        int(tu.get("input_cache_creation", 0) or 0),
+        int(tu.get("input_cache_read", 0) or 0),
+        int(tu.get("output", 0) or 0),
+    )
+    # Legacy transcripts carry no model string anywhere — verified across
+    # the corpus: StatusUpdate payloads expose only context_usage /
+    # context_tokens / max_context_tokens / token_usage / message_id /
+    # plan_mode / mcp_status. Dates are all we have here. Use the RECORD's
+    # own ts so a session spanning a cutoff splits correctly;
+    # first_event_ts is only the fallback for a record with no timestamp.
+    _append_usage_record(
+        st, line_num, ts, payload.get("message_id") or None, None, toks
+    )
+
+
+def _legacy_dispatch(st: _ParseState, msg_type: str, line_num: int,
+                     ts: datetime | None, payload: dict) -> None:
+    if msg_type == "TurnBegin":
+        _turn_boundary(st, line_num, ts)
+    elif msg_type == "TurnEnd":
+        _legacy_turn_end(st, line_num, ts)
+    elif msg_type == "ContentPart":
+        _legacy_content_part(st, payload)
+    elif msg_type == "ToolCall":
+        _legacy_tool_call(st, line_num, ts, payload)
+    elif msg_type == "ToolResult":
+        _legacy_tool_result(st, payload)
+    elif msg_type == "StatusUpdate":
+        _legacy_status_update(st, line_num, ts, payload)
+
+
+def _parse_legacy(file_key: str, blob: bytes) -> dict:
+    """Parse one legacy kimi-cli wire.jsonl.
+
+    records: list of dicts with keys
+      file_key, line_num, uuid, ts, model,
+      fresh_tokens, cache_creation_tokens, cache_read_tokens,
+      output_tokens, text_chars, reply_latency_s, cost_usd
+
+    ctx_turns: list of dicts with keys
+      idx, ts, line, input, output, delta
+    """
+    st = _ParseState(file_key)
+    for line_num, raw in enumerate(blob.splitlines(), 1):
+        if not raw:
+            continue
+        try:
+            obj = orjson.loads(raw)
+        except orjson.JSONDecodeError:
+            continue
+
+        ts_dt = _to_dt(obj.get("timestamp"))
+        if ts_dt is not None and st.first_event_ts is None:
+            st.first_event_ts = ts_dt
+
+        msg = obj.get("message") or {}
+        _legacy_dispatch(
+            st, msg.get("type", ""), line_num, ts_dt, msg.get("payload", {})
+        )
+
+    return _finish_parse(st)
+
+
+# --------------------------------------------------------------------------
+# kimi-code format
+# --------------------------------------------------------------------------
 
 
 def _kc_parse_tool_call(tc: dict) -> tuple[str, str | None, str]:
@@ -344,56 +431,128 @@ def _kc_args_to_input(args) -> dict:
     return {"_raw": args}
 
 
+def _kc_metadata(st: _ParseState, obj: dict) -> None:
+    ts_ms = obj.get("created_at")
+    if ts_ms and st.first_event_ts is None:
+        st.first_event_ts = datetime.fromtimestamp(
+            ts_ms / 1000.0, tz=timezone.utc
+        )
+
+
+def _kc_event_ts(st: _ParseState, obj: dict) -> datetime | None:
+    ts_ms = obj.get("time")
+    ts_dt = (
+        datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        if ts_ms else None
+    )
+    if ts_dt is not None and st.first_event_ts is None:
+        st.first_event_ts = ts_dt
+    return ts_dt
+
+
+def _count_content_text(content: list[dict]) -> int:
+    chars = 0
+    for p in content:
+        if not isinstance(p, dict):
+            continue
+        if p.get("type") == "text":
+            chars += len(str(p.get("text", "")))
+    return chars
+
+
+def _kc_append_message(st: _ParseState, line_num: int, ts: datetime | None,
+                       obj: dict) -> None:
+    msg = obj.get("message") or {}
+    role = msg.get("role")
+    if role == "assistant":
+        st.text_chars_since_turn += _count_content_text(
+            msg.get("content") or []
+        )
+        for tc in msg.get("toolCalls") or []:
+            # The arguments are parsed but not persisted — the tool_uses
+            # table carries name and error state only.
+            name, _args, tcid = _kc_parse_tool_call(tc)
+            _append_tool_use(st, line_num, ts, name, tcid)
+        _mark_assistant_event(st)
+    elif role == "tool":
+        tcid = msg.get("toolCallId", "")
+        if tcid:
+            st.tool_result_is_error[str(tcid)] = bool(msg.get("isError"))
+    # role == user / system: no parser-side action
+
+
+def _kc_step_begin(st: _ParseState, line_num: int, ts: datetime | None,
+                   turn_id: str | None) -> None:
+    if turn_id != st.current_turn_id:
+        _close_turn(st, line_num, ts)
+        st.current_turn_id = turn_id
+        _start_turn(st, line_num, ts)
+
+
+def _kc_loop_event(st: _ParseState, line_num: int, ts: datetime | None,
+                   obj: dict) -> None:
+    ev = obj.get("event") or {}
+    et = ev.get("type")
+    if et == "step.begin":
+        _kc_step_begin(st, line_num, ts, ev.get("turnId"))
+    elif et == "content.part":
+        part = ev.get("part") or {}
+        if part.get("type") == "text":
+            st.text_chars_since_turn += len(str(part.get("text", "")))
+        _mark_assistant_event(st)
+    elif et == "tool.call":
+        _append_tool_use(
+            st, line_num, ts,
+            str(ev.get("name", "")), str(ev.get("toolCallId", "")),
+        )
+        _mark_assistant_event(st)
+    elif et == "tool.result":
+        res = ev.get("result") or {}
+        tcid = ev.get("toolCallId", "")
+        if tcid:
+            st.tool_result_is_error[str(tcid)] = bool(
+                res.get("isError") if isinstance(res, dict) else False
+            )
+    # et == "step.end": informational; the turn stays open until the next
+    # turn boundary (new turnId or turn.prompt).
+
+
+def _kc_usage_record(st: _ParseState, line_num: int, ts: datetime | None,
+                     obj: dict) -> None:
+    usage = obj.get("usage") or {}
+    toks = (
+        int(usage.get("inputOther") or 0),
+        int(usage.get("inputCacheCreation") or 0),
+        int(usage.get("inputCacheRead") or 0),
+        int(usage.get("output") or 0),
+    )
+    # Every usage.record names its model (verified: 7,397/7,397 in the
+    # corpus, values "kimi-code/k3" and "kimi-code/kimi-for-coding").
+    # Honour it; dates decide only what the wire cannot express.
+    _append_usage_record(
+        st, line_num, ts, f"{st.file_key}:{line_num}", obj.get("model"), toks
+    )
+
+
+def _kc_dispatch(st: _ParseState, typ: str, line_num: int,
+                 ts: datetime | None, obj: dict) -> None:
+    # Turn boundary: turn.prompt / turn.steer
+    if typ in ("turn.prompt", "turn.steer"):
+        _turn_boundary(st, line_num, ts)
+    elif typ == "context.append_message":
+        _kc_append_message(st, line_num, ts, obj)
+    elif typ == "context.append_loop_event":
+        _kc_loop_event(st, line_num, ts, obj)
+    elif typ == "usage.record":
+        _kc_usage_record(st, line_num, ts, obj)
+
+
 def _parse_kimi_code(file_key: str, blob: bytes) -> dict:
     """Parse one kimi-code wire.jsonl.
 
     Returns the same shape as _parse_legacy.
     """
-    records_in_order: list[dict] = []
-    tool_uses: list[dict] = []
-    rate_limit_hits: list[dict] = []
-    tool_result_is_error: dict[str, bool] = {}
-
-    turns: list[dict] = []
-    current_turn: dict | None = None
-    current_turn_id: str | None = None
-
-    pending_turn_begin_ts: datetime | None = None
-    pending_turn_begin_line: int = 0
-    turn_has_assistant_event: bool = False
-    text_chars_since_turn: int = 0
-
-    first_event_ts: datetime | None = None
-
-    def _close_turn(line_num: int, ts: datetime | None) -> None:
-        nonlocal current_turn
-        if current_turn is not None:
-            current_turn["end_line"] = line_num
-            current_turn["end_ts"] = ts
-            turns.append(current_turn)
-            current_turn = None
-
-    def _start_turn(line_num: int, ts: datetime | None) -> None:
-        nonlocal current_turn, turn_has_assistant_event, text_chars_since_turn
-        current_turn = {
-            "begin_line": line_num,
-            "begin_ts": ts,
-            "end_line": None,
-            "end_ts": None,
-            "status_lines": [],
-        }
-        turn_has_assistant_event = False
-        text_chars_since_turn = 0
-
-    def _count_content_text(content: list[dict]) -> int:
-        chars = 0
-        for p in content:
-            if not isinstance(p, dict):
-                continue
-            if p.get("type") == "text":
-                chars += len(str(p.get("text", "")))
-        return chars
-
+    st = _ParseState(file_key)
     for line_num, raw in enumerate(blob.splitlines(), 1):
         if not raw:
             continue
@@ -404,198 +563,13 @@ def _parse_kimi_code(file_key: str, blob: bytes) -> dict:
 
         typ = obj.get("type")
         if typ == "metadata":
-            ts_ms = obj.get("created_at")
-            if ts_ms and first_event_ts is None:
-                first_event_ts = datetime.fromtimestamp(
-                    ts_ms / 1000.0, tz=timezone.utc
-                )
+            _kc_metadata(st, obj)
             continue
 
-        ts_ms = obj.get("time")
-        ts_dt = (
-            datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
-            if ts_ms else None
-        )
-        if ts_dt is not None and first_event_ts is None:
-            first_event_ts = ts_dt
+        ts_dt = _kc_event_ts(st, obj)
+        _kc_dispatch(st, typ, line_num, ts_dt, obj)
 
-        # Turn boundary: turn.prompt / turn.steer
-        if typ in ("turn.prompt", "turn.steer"):
-            _close_turn(line_num, ts_dt)
-            _start_turn(line_num, ts_dt)
-            pending_turn_begin_ts = ts_dt
-            pending_turn_begin_line = line_num
-            turn_has_assistant_event = False
-            text_chars_since_turn = 0
-            continue
-
-        if typ == "context.append_message":
-            msg = obj.get("message") or {}
-            role = msg.get("role")
-            content = msg.get("content") or []
-
-            if role == "assistant":
-                text_chars_since_turn += _count_content_text(content)
-                for tc in msg.get("toolCalls") or []:
-                    name, args, tcid = _kc_parse_tool_call(tc)
-                    tool_uses.append({
-                        "file_key": file_key,
-                        "line_num": line_num,
-                        "idx": len(tool_uses),
-                        "ts": ts_dt,
-                        "tool_name": name,
-                        "tool_call_id": tcid,
-                        "is_error": None,
-                    })
-                if not turn_has_assistant_event and pending_turn_begin_ts is not None:
-                    turn_has_assistant_event = True
-                continue
-
-            if role == "tool":
-                tcid = msg.get("toolCallId", "")
-                if tcid:
-                    tool_result_is_error[str(tcid)] = bool(msg.get("isError"))
-                continue
-
-            # role == user / system: no parser-side action
-            continue
-
-        if typ == "context.append_loop_event":
-            ev = obj.get("event") or {}
-            et = ev.get("type")
-            turn_id = ev.get("turnId")
-
-            if et == "step.begin":
-                if turn_id != current_turn_id:
-                    _close_turn(line_num, ts_dt)
-                    current_turn_id = turn_id
-                    _start_turn(line_num, ts_dt)
-                continue
-
-            if et == "step.end":
-                # Step end is informational; the turn stays open until the next
-                # turn boundary (new turnId or turn.prompt).
-                continue
-
-            if et == "content.part":
-                part = ev.get("part") or {}
-                if part.get("type") == "text":
-                    text_chars_since_turn += len(str(part.get("text", "")))
-                if not turn_has_assistant_event and pending_turn_begin_ts is not None:
-                    turn_has_assistant_event = True
-                continue
-
-            if et == "tool.call":
-                tool_uses.append({
-                    "file_key": file_key,
-                    "line_num": line_num,
-                    "idx": len(tool_uses),
-                    "ts": ts_dt,
-                    "tool_name": str(ev.get("name", "")),
-                    "tool_call_id": str(ev.get("toolCallId", "")),
-                    "is_error": None,
-                })
-                if not turn_has_assistant_event and pending_turn_begin_ts is not None:
-                    turn_has_assistant_event = True
-                continue
-
-            if et == "tool.result":
-                res = ev.get("result") or {}
-                tcid = ev.get("toolCallId", "")
-                is_err = bool(
-                    res.get("isError") if isinstance(res, dict) else False
-                )
-                if tcid:
-                    tool_result_is_error[str(tcid)] = is_err
-                continue
-
-            continue
-
-        if typ == "usage.record":
-            usage = obj.get("usage") or {}
-            fresh = int(usage.get("inputOther") or 0)
-            create = int(usage.get("inputCacheCreation") or 0)
-            read = int(usage.get("inputCacheRead") or 0)
-            output = int(usage.get("output") or 0)
-            total_input = fresh + create + read
-
-            reply_latency_s: float | None = None
-            if pending_turn_begin_ts is not None and ts_dt is not None:
-                delta_s = (ts_dt - pending_turn_begin_ts).total_seconds()
-                if delta_s >= 0:
-                    reply_latency_s = delta_s
-            pending_turn_begin_ts = None
-
-            # Every usage.record names its model (verified: 7,397/7,397 in the
-            # corpus, values "kimi-code/k3" and "kimi-code/kimi-for-coding").
-            # Honour it; dates decide only what the wire cannot express.
-            # Per-record ts, because a session can switch model mid-flight.
-            model = _model_for(obj.get("model"), ts_dt or first_event_ts)
-            cost = pricing.compute_cost(
-                model,
-                fresh=fresh, create=create, read=read, output=output,
-            )
-
-            records_in_order.append({
-                "file_key": file_key,
-                "line_num": line_num,
-                "uuid": f"{file_key}:{line_num}",
-                "ts": ts_dt,
-                "model": model,
-                "fresh_tokens": fresh,
-                "cache_creation_tokens": create,
-                "cache_read_tokens": read,
-                "output_tokens": output,
-                "cost_usd": round(cost, 6),
-                "text_chars": text_chars_since_turn,
-                "reply_latency_s": reply_latency_s,
-                "ctx_input": total_input,
-            })
-
-            if current_turn is not None:
-                current_turn["status_lines"].append(line_num)
-            continue
-
-    # Close any dangling turn
-    _close_turn(len(blob.splitlines()), None)
-
-    # Resolve tool_result.is_error onto each tool_uses entry
-    for tu in tool_uses:
-        tc_id = tu.pop("tool_call_id", "")
-        if tc_id and tc_id in tool_result_is_error:
-            tu["is_error"] = tool_result_is_error[tc_id]
-
-    # Build ctx_turns from turns + records
-    rec_by_line = {r["line_num"]: r for r in records_in_order}
-    ctx_turns: list[dict] = []
-    prev_input = 0
-    turn_idx = 0
-    for turn in turns:
-        if not turn["status_lines"]:
-            continue
-        last_line = turn["status_lines"][-1]
-        rec = rec_by_line.get(last_line)
-        if not rec or rec["ctx_input"] <= 0:
-            continue
-        turn_idx += 1
-        ctx_input = rec["ctx_input"]
-        ctx_turns.append({
-            "idx": turn_idx,
-            "ts": rec["ts"].isoformat() if rec["ts"] else "",
-            "line": last_line,
-            "input": ctx_input,
-            "output": rec["output_tokens"],
-            "delta": ctx_input - prev_input,
-        })
-        prev_input = ctx_input
-
-    return {
-        "records": records_in_order,
-        "ctx_turns": ctx_turns,
-        "turn_count": len(ctx_turns),
-        "rate_limit_hits": rate_limit_hits,
-        "tool_uses": tool_uses,
-    }
+    return _finish_parse(st, len(blob.splitlines()))
 
 
 def parse_file(file_key: str, blob: bytes) -> dict:
