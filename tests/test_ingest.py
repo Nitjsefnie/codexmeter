@@ -53,7 +53,10 @@ def _scalar(c, sql: str, args: tuple = ()):
     Optional, so a None here means the test's premise broke — assert
     instead of subscripting it.
     """
-    row = c.execute(sql, args).fetchone()
+    # args defaults to "no params at all", NOT (): several queries carry a
+    # literal LIKE '%...' that psycopg would read as a placeholder the
+    # moment a params sequence is passed.
+    row = (c.execute(sql, args) if args else c.execute(sql)).fetchone()
     assert row is not None, f"query returned no rows: {sql[:60]}"
     return row[0]
 
