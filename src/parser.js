@@ -124,12 +124,6 @@ function parseTimestamp(ts) {
   return isNaN(d.getTime()) ? null : d;
 }
 
-function shortTime(ts) {
-  const dt = parseTimestamp(ts);
-  if (!dt) return "????-??-?? ??:??:??";
-  return dt.toISOString().replace("T", " ").slice(0, 19);
-}
-
 function _iterJsonObjects(line) {
   const out = [];
   let pos = 0;
@@ -710,70 +704,6 @@ window.parseTranscript = function parseTranscript(blob) {
   return _parseLegacy(blob);
 };
 
-window.computeStats = function computeStats(events, metaEvents) {
-  metaEvents = metaEvents || [];
-  const toolCounts = {};
-  let userMessages = 0;
-  let assistantMessages = 0;
-  let thinkingBlocks = 0;
-  let toolResults = 0;
-  let errorResults = 0;
-  let firstTs = null;
-  let lastTs = null;
-
-  for (const e of events) {
-    const dt = parseTimestamp(e.ts);
-    if (dt) {
-      if (!firstTs) firstTs = dt;
-      lastTs = dt;
-    }
-    if (e.type === "tool_call") {
-      toolCounts[e.tool_name] = (toolCounts[e.tool_name] || 0) + 1;
-    } else if (e.type === "user_message") {
-      userMessages++;
-    } else if (e.type === "assistant_text") {
-      assistantMessages++;
-    } else if (e.type === "thinking") {
-      thinkingBlocks++;
-    } else if (e.type === "tool_result") {
-      toolResults++;
-      if (e.is_error) errorResults++;
-    }
-  }
-
-  let duration = "";
-  if (firstTs && lastTs) {
-    const delta = (lastTs - firstTs) / 1000;
-    duration = `${Math.floor(delta / 60)}m ${Math.floor(delta % 60)}s`;
-  }
-
-  const turnCount = metaEvents.filter(m => m.type === "turn_begin").length;
-
-  const lines = [
-    "SESSION STATISTICS",
-    "=" * 40,
-    firstTs ? `Start:      ${firstTs.toISOString().slice(0, 19)} UTC` : "",
-    lastTs ? `End:        ${lastTs.toISOString().slice(0, 19)} UTC` : "",
-    duration ? `Duration:   ${duration}  (wall)` : "",
-    `Events:     ${events.length}`,
-    `User msgs:  ${userMessages}`,
-    `Asst msgs:  ${assistantMessages}`,
-    `Thinking:   ${thinkingBlocks}`,
-    `Tool calls: ${Object.values(toolCounts).reduce((a, b) => a + b, 0)}`,
-    `Results:    ${toolResults} (${errorResults} errors)`,
-    `Turns:      ${turnCount}`,
-  ];
-
-  if (Object.keys(toolCounts).length) {
-    lines.push("", "TOOL USAGE:");
-    for (const [tool, count] of Object.entries(toolCounts).sort((a, b) => b[1] - a[1])) {
-      lines.push(`  ${tool.padEnd(20)} ${count.toString().padStart(4)}`);
-    }
-  }
-
-  return lines.filter(Boolean).join("\n");
-};
-
 // Per-call context-window input, kimimeter shape: a status_update's
 // token_usage. Claudit's version summed input_tokens + cache_creation +
 // cache_read and took the peak across usage.iterations (sub-agent fan-out);
@@ -822,9 +752,7 @@ window.asUsageRecord = function asUsageRecord(m, fallbackTs) {
   };
 };
 
-// SessionHeader's stats, as an OBJECT — NOT the human-readable string
-// computeStats above returns; the two serve different consumers and
-// computeStats' behaviour is unchanged. Ported from claudit's
+// SessionHeader's stats, as an OBJECT. Ported from claudit's
 // computeSessionStats onto kimimeter's parsed shapes: claudit read
 // meta type "assistant_usage" with usage.{input,cache_creation,cache_read,
 // output}_tokens; kimimeter's parser emits type "status_update" with
@@ -883,7 +811,7 @@ window.computeSessionStats = function computeSessionStats(events, metaEvents) {
     stats.read += u.read;
     stats.output += u.output;
     // Per-record rates (the model was resolved inside asUsageRecord),
-    // exactly as the record builders and computeCache: a session can span a
+    // exactly as the record builders: a session can span a
     // cutoff or switch model mid-flight, so one session-wide rate would
     // misprice part of it.
     const r = window.rateForModel(u.model);
@@ -898,136 +826,4 @@ window.computeSessionStats = function computeSessionStats(events, metaEvents) {
   stats.totalInput = stats.fresh + stats.create + stats.read;
   stats.hitRate = stats.totalInput ? (stats.read / stats.totalInput) * 100 : 0;
   return stats;
-};
-
-window.computeCache = function computeCache(metaEvents, firstEventTs) {
-  // Cost is accumulated per record at that record's own rates — a session can
-  // span a cutoff or switch model mid-flight, so one session-wide rate would
-  // misprice part of it. The rates line below reports the dominant model.
-  const perModel = {};
-  let costFresh = 0, costRead = 0, costCreate = 0, costOutput = 0;
-  let totalInputOther = 0;
-  let totalOutput = 0;
-  let totalCacheRead = 0;
-  let totalCacheCreate = 0;
-  let count = 0;
-
-  for (const m of metaEvents) {
-    if (m.type !== "status_update") continue;
-    const tu = m.token_usage;
-    if (!tu) continue;
-    count++;
-    const fresh = tu.input_other || 0;
-    const output = tu.output || 0;
-    const read = tu.input_cache_read || 0;
-    const create = tu.input_cache_creation || 0;
-    totalInputOther += fresh;
-    totalOutput += output;
-    totalCacheRead += read;
-    totalCacheCreate += create;
-
-    const model = modelFor(m.wire_model, m.ts != null ? m.ts : firstEventTs);
-    perModel[model] = (perModel[model] || 0) + 1;
-    const r = window.rateForModel(model);
-    costFresh += fresh * r.fresh / 1e6;
-    costRead += read * r.read / 1e6;
-    costCreate += create * r.create / 1e6;
-    costOutput += output * r.output / 1e6;
-  }
-
-  if (!count) return "CACHE / TOKEN USAGE\n" + "=" * 40 + "\n(no StatusUpdate with token_usage found)";
-
-  const totalIn = totalInputOther + totalCacheRead + totalCacheCreate;
-  const hit = totalIn ? (totalCacheRead / totalIn * 100.0) : 0.0;
-
-  const freshCost = costFresh;
-  const cacheReadCost = costRead;
-  const cacheCreateCost = costCreate;
-  const outputCost = costOutput;
-  const totalCost = freshCost + cacheReadCost + cacheCreateCost + outputCost;
-
-  // Dominant model, for the rates line only — the costs above are per-record.
-  const domModel = Object.keys(perModel).sort((a, b) => perModel[b] - perModel[a])[0]
-    || modelFor(null, firstEventTs);
-  const rates = window.rateForModel(domModel);
-  const mixed = Object.keys(perModel).length > 1;
-
-  const lines = [
-    "CACHE / TOKEN USAGE",
-    "=" * 40,
-    `StatusUpdates: ${count}`,
-    `  input total:     ${totalIn.toLocaleString().padStart(12)}`,
-    `    fresh:         ${totalInputOther.toLocaleString().padStart(12)}`,
-    totalCacheCreate ? `    cache_create:  ${totalCacheCreate.toLocaleString().padStart(12)}` : "",
-    `    cache_read:    ${totalCacheRead.toLocaleString().padStart(12)}`,
-    `  output:          ${totalOutput.toLocaleString().padStart(12)}`,
-    `  hit rate:        ${hit.toFixed(1)}%`,
-    "",
-    "ESTIMATED BILLING",
-    `  Rates (USD per 1M tokens, ${domModel}${mixed ? " — dominant; costs below are per-record" : ""}): fresh=$${rates.fresh.toFixed(2)}  cache_read=$${rates.read.toFixed(2)}  cache_create=$${rates.create.toFixed(2)}  output=$${rates.output.toFixed(2)}`,
-    `  ${"Category".padEnd(20)} ${"Cost".padStart(10)}`,
-    `  ${"-".repeat(20)} ${"-".repeat(10)}`,
-    freshCost ? `  ${"Fresh input".padEnd(20)} $${freshCost.toFixed(2).padStart(9)}` : "",
-    cacheReadCost ? `  ${"Cache read".padEnd(20)} $${cacheReadCost.toFixed(2).padStart(9)}` : "",
-    cacheCreateCost ? `  ${"Cache create".padEnd(20)} $${cacheCreateCost.toFixed(2).padStart(9)}` : "",
-    outputCost ? `  ${"Output".padEnd(20)} $${outputCost.toFixed(2).padStart(9)}` : "",
-    `  ${"-".repeat(20)} ${"-".repeat(10)}`,
-    `  ${"TOTAL".padEnd(20)} $${totalCost.toFixed(2).padStart(9)}`,
-  ];
-  return lines.filter(Boolean).join("\n");
-};
-
-window.computeContextGrowth = function computeContextGrowth(metaEvents) {
-  const lines = ["CONTEXT GROWTH", "=" * 40];
-  const usageRecords = [];
-
-  for (const m of metaEvents) {
-    if (m.type !== "status_update") continue;
-    const tu = m.token_usage;
-    if (!tu) continue;
-    const inputOther = tu.input_other || 0;
-    const cacheRead = tu.input_cache_read || 0;
-    const cacheCreate = tu.input_cache_creation || 0;
-    const output = tu.output || 0;
-    usageRecords.push({
-      ts: m.ts,
-      line: m.line,
-      input: inputOther + cacheRead + cacheCreate,
-      output,
-    });
-  }
-
-  if (!usageRecords.length) {
-    lines.push("(no StatusUpdate with token_usage found)");
-    return lines.join("\n");
-  }
-
-  // Dedupe by line
-  const seen = new Set();
-  const deduped = [];
-  for (let i = usageRecords.length - 1; i >= 0; i--) {
-    const rec = usageRecords[i];
-    if (!seen.has(rec.line)) {
-      seen.add(rec.line);
-      deduped.push(rec);
-    }
-  }
-  deduped.reverse();
-
-  lines.push(`  ${"#".padStart(4)}  ${"time".padEnd(19)}  ${"L#".padStart(5)}  ${"input".padStart(10)}  ${"output".padStart(8)}  ${"delta".padStart(10)}`);
-  let prevInput = 0;
-  for (let idx = 0; idx < deduped.length; idx++) {
-    const t = deduped[idx];
-    const delta = t.input - prevInput;
-    lines.push(
-      `  ${(idx + 1).toString().padStart(4)}  ${shortTime(t.ts).padEnd(19)}  ` +
-      `L${t.line.toString().padEnd(4)}  ` +
-      `${t.input.toLocaleString().padStart(10)}  ` +
-      `${t.output.toLocaleString().padStart(8)}  ` +
-      `${(delta >= 0 ? "+" : "") + delta.toLocaleString().padStart(9)}`
-    );
-    prevInput = t.input;
-  }
-  lines.push("", `Total: ${deduped.length} snapshots, final context: ${deduped[deduped.length - 1].input.toLocaleString()} input tokens`);
-  return lines.join("\n");
 };

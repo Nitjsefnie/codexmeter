@@ -1,10 +1,11 @@
 """Unit tests for window.computeSessionStats / window.usageCtxInput (issue #10).
 
-The Inspector's SessionHeader consumes an OBJECT of session stats, but
-src/parser.js only ever shipped computeStats — which returns a
-human-readable STRING and would throw on stats.hitRate.toFixed(1). The two
-window globals the view actually calls were never defined in this repo at
-all (a claudit carry-over), so the whole single-session view crashed.
+The Inspector's SessionHeader consumes an OBJECT of session stats, but the
+two window globals the view actually calls were never defined in this repo
+at all (a claudit carry-over), so the whole single-session view crashed.
+The only stats builder src/parser.js shipped at the time returned a
+human-readable STRING and would have thrown on stats.hitRate.toFixed(1);
+it had no consumer and was removed in #16.
 
 These tests drive the REAL src/parser.js through node — no npm, no build
 step, matching the repo's in-browser-Babel, no-toolchain rule (same
