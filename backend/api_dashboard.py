@@ -387,35 +387,39 @@ def _dash_rows(q: _DashQuery, ph: Phases) -> _DashRows:
             rl_args,
         ).fetchall()
 
-        # Lines added/deleted per bucket — two separate POSITIVE series
-        # (issue #17), read off the same dual-path tool source as the tool
-        # endpoints: tool_rollup at >= 1h buckets, the live tool_uses
-        # subquery below that. No model dimension exists on tool_uses
-        # (its line_nums are disjoint from records'), so ?model= does not
-        # constrain this series — same caveat the tool endpoints carry.
-        churn_args: list[Any] = [q.args[0]]  # since
-        churn_proj = _proj_tool(q.project, churn_args)
-        churn_rows = ph.execute(
-            "churn", c,
-            db.sql_literal(f"""
-            SELECT to_timestamp(
-                     floor(EXTRACT(EPOCH FROM t.hour) / {q.bucket_s}) * {q.bucket_s} + {q.bucket_s} / 2
-                   ) AS bucket,
-                   SUM(t.lines_added)   AS lines_added,
-                   SUM(t.lines_deleted) AS lines_deleted
-            FROM {_tool_source(q.bucket_s)}
-            WHERE t.hour >= %s {churn_proj}
-            GROUP BY 1
-            ORDER BY 1
-            """),
-            churn_args,
-        ).fetchall()
+        churn_rows = _dash_churn_rows(c, q, ph)
 
     return _DashRows(
         hourly_rows, response_sizes_rows, total_sessions,
         cost_by_project_rows, file_counts, sessions_rows, ctx_traces_rows,
         rl_rows, churn_rows,
     )
+
+
+def _dash_churn_rows(c, q: _DashQuery, ph: Phases) -> list:
+    """Lines added/deleted per bucket — two separate POSITIVE series
+    (issue #17), read off the same dual-path tool source as the tool
+    endpoints: tool_rollup at >= 1h buckets, the live tool_uses
+    subquery below that. No model dimension exists on tool_uses
+    (its line_nums are disjoint from records'), so ?model= does not
+    constrain this series — same caveat the tool endpoints carry."""
+    args: list[Any] = [q.args[0]]  # since
+    proj = _proj_tool(q.project, args)
+    return ph.execute(
+        "churn", c,
+        db.sql_literal(f"""
+        SELECT to_timestamp(
+                 floor(EXTRACT(EPOCH FROM t.hour) / {q.bucket_s}) * {q.bucket_s} + {q.bucket_s} / 2
+               ) AS bucket,
+               SUM(t.lines_added)   AS lines_added,
+               SUM(t.lines_deleted) AS lines_deleted
+        FROM {_tool_source(q.bucket_s)}
+        WHERE t.hour >= %s {proj}
+        GROUP BY 1
+        ORDER BY 1
+        """),
+        args,
+    ).fetchall()
 
 
 def _dash_cost_by_model(hourly: list) -> list:

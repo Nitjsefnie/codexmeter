@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from backend import parse, pricing
-from backend.parse import _canonical_model, _model_for
+from backend.parse import _canonical_model, _line_count, _model_for
 
 
 FIX = Path(__file__).resolve().parents[1] / "fixtures" / "parser"
@@ -658,9 +658,9 @@ def test_no_edit_tools_means_zero_churn_everywhere():
 
 def test_line_count_conventions():
     """Trailing newline terminates, a final partial line still counts."""
-    assert parse._line_count("") == 0
-    assert parse._line_count(None) == 0
-    assert parse._line_count("a") == 1
-    assert parse._line_count("a\n") == 1
-    assert parse._line_count("a\nb") == 2
-    assert parse._line_count("a\nb\n") == 2
+    assert _line_count("") == 0
+    assert _line_count(None) == 0
+    assert _line_count("a") == 1
+    assert _line_count("a\n") == 1
+    assert _line_count("a\nb") == 2
+    assert _line_count("a\nb\n") == 2
