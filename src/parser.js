@@ -583,7 +583,6 @@ function _parseKimiCode(blob) {
       const create = usage.inputCacheCreation || 0;
       const read = usage.inputCacheRead || 0;
       const output = usage.output || 0;
-      const totalInput = fresh + create + read;
 
       let replyLatencyS = null;
       if (pendingTurnBeginTs && ts != null) {
