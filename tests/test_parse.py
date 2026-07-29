@@ -540,3 +540,63 @@ def test_parser_only_ever_emits_the_three_canonical_models():
     assert out["records"], "fixture must produce records"
     for r in out["records"]:
         assert r["model"] in VALID_MODELS, r["model"]
+
+
+# --- llm.error -> rate_limit_hits (issue #1) --------------------------------
+#
+# Shape taken from the producer that emits it, Nitjsefnie-OSC/kimi-code@e7bb820
+# (`llm.error` op, packages/agent-core-v2/src/agent/llmRequester/llmRequestOps.ts):
+# payload fields are flattened onto the wire line next to "type" and "time",
+# the same envelope every other op uses.
+
+def _kc_llm_error_blob(kind: str, message: str = "You are out of quota.") -> bytes:
+    """kimi-code wire carrying one llm.error of the given `kind`."""
+    base_ms = int(parse.K3_CUTOFF_EPOCH * 1000)
+    return (
+        b'{"type":"metadata","protocol_version":"1.4","created_at":%d}\n'
+        b'{"type":"llm.error","time":%d,"kind":"%s","statusCode":429,'
+        b'"retryable":false,"errorName":"APIProviderQuotaExhaustedError",'
+        b'"message":"%s","model":"k3","durationMs":812}\n'
+        % (base_ms, base_ms + 1000, kind.encode(), message.encode())
+    )
+
+
+def test_quota_exhausted_llm_error_is_recorded_as_a_rate_limit_hit():
+    """The one event worth recording: a hard quota stop."""
+    out = parse.parse_file(
+        "sessions/projKC/sess-rl/wire.jsonl",
+        _kc_llm_error_blob("quota_exhausted"),
+    )
+    assert len(out["rate_limit_hits"]) == 1
+    hit = out["rate_limit_hits"][0]
+    assert hit["line"] == 2
+    assert hit["content"] == "You are out of quota."
+    assert hit["ts"].startswith(
+        datetime.fromtimestamp(
+            parse.K3_CUTOFF_EPOCH + 1, tz=timezone.utc
+        ).isoformat()[:19]
+    )
+
+
+def test_transient_rate_limit_llm_error_is_not_recorded():
+    """kind="rate_limit" is the provider shaping traffic per minute, not the
+    wall the user hits. claudit excludes the same case by text-matching "out
+    of extra usage"; here the classification is a field, so the two dashboards
+    count the same thing.
+    """
+    out = parse.parse_file(
+        "sessions/projKC/sess-rl/wire.jsonl",
+        _kc_llm_error_blob("rate_limit"),
+    )
+    assert out["rate_limit_hits"] == []
+
+
+def test_llm_error_content_is_capped_at_500_chars():
+    """Provider messages are unbounded free text. The producer truncates at
+    500 (LLM_ERROR_MESSAGE_MAX_LENGTH) but the journal is not ours to trust.
+    """
+    out = parse.parse_file(
+        "sessions/projKC/sess-rl/wire.jsonl",
+        _kc_llm_error_blob("quota_exhausted", "x" * 900),
+    )
+    assert len(out["rate_limit_hits"][0]["content"]) == 500

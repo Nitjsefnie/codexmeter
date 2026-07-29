@@ -534,6 +534,34 @@ def _kc_usage_record(st: _ParseState, line_num: int, ts: datetime | None,
     )
 
 
+def _kc_llm_error(st: _ParseState, line_num: int, ts: datetime | None,
+                  obj: dict) -> None:
+    """Book a failed provider request as a rate-limit hit, if it is one.
+
+    kimi-code journals every non-aborted provider failure as an `llm.error`
+    op (Nitjsefnie-OSC/kimi-code@e7bb820) and carries its own classification
+    in `kind`, so a hard quota stop is told apart from an ordinary
+    per-minute 429 by a field rather than by matching message text — the
+    signal claudit has to recover from "out of extra usage" in the body.
+
+    Only `quota_exhausted` is recorded. `rate_limit` is the provider
+    shaping traffic; it clears itself and is not the wall the user hits.
+    claudit excludes the same case deliberately, so counting it here would
+    make the two dashboards' stats mean different things.
+
+    Content is re-capped at 500 even though the producer already truncates
+    there: the cap belongs to whatever writes the column, not to a
+    journal written by a different program.
+    """
+    if obj.get("kind") != "quota_exhausted":
+        return
+    st.rate_limit_hits.append({
+        "line": line_num,
+        "ts": ts.isoformat() if ts is not None else "",
+        "content": str(obj.get("message") or "")[:500],
+    })
+
+
 def _kc_dispatch(st: _ParseState, typ: str, line_num: int,
                  ts: datetime | None, obj: dict) -> None:
     # Turn boundary: turn.prompt / turn.steer
@@ -545,6 +573,8 @@ def _kc_dispatch(st: _ParseState, typ: str, line_num: int,
         _kc_loop_event(st, line_num, ts, obj)
     elif typ == "usage.record":
         _kc_usage_record(st, line_num, ts, obj)
+    elif typ == "llm.error":
+        _kc_llm_error(st, line_num, ts, obj)
 
 
 def _parse_kimi_code(file_key: str, blob: bytes) -> dict:
