@@ -721,6 +721,18 @@ function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashN
     return { ...t, byModel: hasBackendByModel ? backendByModel : byModel };
   }, [events, backendByModel, hasBackendByModel]);
 
+  // Churn is its own per-bucket series with no model dimension (one row
+  // per bucket), so the range total is a plain sum — no double-counting
+  // to work around like the model-split token rows have.
+  const churnTotals = useMemo(() => {
+    const t = { added: 0, deleted: 0 };
+    for (const c of churnEvents || []) {
+      t.added += c.lines_added || 0;
+      t.deleted += c.lines_deleted || 0;
+    }
+    return t;
+  }, [churnEvents]);
+
   // Auto-pick bin size: at least 100 buckets, never coarser than 1 day.
   // Pick the LARGEST nice-bin in [60s, 1d] that still produces ≥100 bins
   // across the visible range; if even 60s overshoots, that's fine.
@@ -778,6 +790,13 @@ function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashN
           <Stat label="total" value={((mainWUsage || 0) + (mainEmpty || 0) + (subagentFiles || 0)).toLocaleString()} />}
         <Stat label="requests" value={events.reduce((s, e) => s + (e.requests == null ? 1 : e.requests), 0).toLocaleString()} />
         <Stat label="total tokens" value={window.humanFmt(totals.total)} />
+        {churnEvents && <Stat label="lines added / deleted" value={
+          <span>
+            <span style={{ color: window.dashboardCol.linesAdded }}>+{window.humanFmt(churnTotals.added)}</span>
+            <span style={{ color: 'var(--muted-2)' }}> / </span>
+            <span style={{ color: window.dashboardCol.linesDeleted }}>−{window.humanFmt(churnTotals.deleted)}</span>
+          </span>
+        } />}
         <Stat label="total cost" value={totalCostStr} highlight />
         <Stat label="rate-limit hits" value={String(limitHits.length)} warn={limitHits.length > 0} />
       </div>
