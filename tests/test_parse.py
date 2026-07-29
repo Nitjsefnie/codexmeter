@@ -600,3 +600,67 @@ def test_llm_error_content_is_capped_at_500_chars():
         _kc_llm_error_blob("quota_exhausted", "x" * 900),
     )
     assert len(out["rate_limit_hits"][0]["content"]) == 500
+
+
+def _churn_by_tool(out):
+    """tool_name -> (lines_added, lines_deleted), one entry per tool_uses row."""
+    return [
+        (tu["tool_name"], tu["is_error"], tu["lines_added"], tu["lines_deleted"])
+        for tu in out["tool_uses"]
+    ]
+
+
+def test_kimi_code_edit_write_churn_from_call_args():
+    """The wire's tool RESULT carries no diff ("Replaced 1 occurrence in
+    <path>"), so added/deleted line counts come from the call's args:
+    Edit -> lines(new_string) / lines(old_string), Write -> lines(content).
+    """
+    out = parse.parse_file(
+        "sessions/projLC/sess-lc/wire.jsonl", _read("line_churn_kimi_code.jsonl")
+    )
+    assert _churn_by_tool(out) == [
+        ("Edit", False, 4, 3),     # "a\nb\nc" -> "a\nB\nc\nd"
+        ("Write", False, 2, 0),    # content "x\ny\n"; overwrite size unknowable
+        ("Edit", True, 0, 0),      # is_error -> the rejected edit changed nothing
+        ("Bash", False, 0, 0),     # not a file-mutating tool
+    ]
+
+
+def test_legacy_str_replace_and_write_churn():
+    """Legacy StrReplaceFile takes {edit: {old, new}} OR {edit: [edits]};
+    WriteFile contributes added lines only."""
+    out = parse.parse_file(
+        "sessions/projLC/sess-lcl/wire.jsonl", _read("line_churn_legacy.jsonl")
+    )
+    assert _churn_by_tool(out) == [
+        ("StrReplaceFile", False, 1, 2),  # single edit object
+        ("StrReplaceFile", False, 4, 3),  # list of edits, summed
+        ("WriteFile", False, 2, 0),
+        ("WriteFile", True, 0, 0),        # is_error -> zeroed
+    ]
+
+
+def test_no_edit_tools_means_zero_churn_everywhere():
+    """The empty/no-churn case: a file with no file-mutating calls parses
+    with explicit zeros, not missing keys, so ingest can insert blindly."""
+    out = parse.parse_file(
+        "sessions/projA/sess-A/wire.jsonl", _read("single_turn.jsonl")
+    )
+    assert out["tool_uses"] == []
+    out = parse.parse_file(
+        "sessions/projErr/sess-err/wire.jsonl", _read("tool_error.jsonl")
+    )
+    assert len(out["tool_uses"]) == 1
+    tu = out["tool_uses"][0]
+    assert tu["lines_added"] == 0
+    assert tu["lines_deleted"] == 0
+
+
+def test_line_count_conventions():
+    """Trailing newline terminates, a final partial line still counts."""
+    assert parse._line_count("") == 0
+    assert parse._line_count(None) == 0
+    assert parse._line_count("a") == 1
+    assert parse._line_count("a\n") == 1
+    assert parse._line_count("a\nb") == 2
+    assert parse._line_count("a\nb\n") == 2

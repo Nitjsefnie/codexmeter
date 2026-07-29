@@ -186,8 +186,78 @@ def _consume_reply_latency(st: _ParseState, ts: datetime | None) -> float | None
     return latency
 
 
+def _line_count(text: object) -> int:
+    """Lines in an edit-payload string. A trailing newline terminates the
+    last line rather than starting another, so "a\n" is 1 line; a final
+    partial line still counts, so "a\nb" is 2."""
+    if not isinstance(text, str) or not text:
+        return 0
+    n = text.count("\n")
+    return n if text.endswith("\n") else n + 1
+
+
+def _edit_churn(tool_name: str, args: dict) -> tuple[int, int]:
+    """(lines_added, lines_deleted) for ONE file-mutating tool call.
+
+    The wire's tool RESULT carries no diff — an Edit result is a prose
+    string like "Replaced 1 occurrence in <path>" — so the counts are
+    derived from the call's ARGS. Verified against the R2 corpus
+    (2026-07, ~300 files sampled): the file-mutating tools come in
+    exactly these shapes, two per wire format:
+
+      kimi-code  Edit  {path, old_string, new_string}   (163/163 calls)
+                 Write {path, content, mode?}
+      legacy     StrReplaceFile {path, edit: {old, new} | [{old, new}, ...]}
+                 WriteFile      {path, content, mode?}
+
+    A Write's deleted count is unknowable — the args carry only the new
+    content, not what was overwritten — so Writes contribute added lines
+    only (append mode and fresh files are the common case anyway). Every
+    other tool returns (0, 0).
+
+    The counts describe the ATTEMPT: a call whose result is an error
+    changed nothing, and _resolve_tool_errors zeroes its churn once the
+    result's is_error is known.
+    """
+    if tool_name == "Edit":
+        return (
+            _line_count(args.get("new_string")),
+            _line_count(args.get("old_string")),
+        )
+    if tool_name in ("Write", "WriteFile"):
+        return (_line_count(args.get("content")), 0)
+    if tool_name == "StrReplaceFile":
+        edit = args.get("edit")
+        edits = edit if isinstance(edit, list) else [edit]
+        added = deleted = 0
+        for e in edits:
+            if isinstance(e, dict):
+                added += _line_count(e.get("new"))
+                deleted += _line_count(e.get("old"))
+        return (added, deleted)
+    return (0, 0)
+
+
+def _args_to_dict(args) -> dict:
+    """Tool-call arguments as a dict, whatever the wire shape: kimi-code
+    carries them already-parsed, legacy as a JSON string. Anything
+    unreadable is {} — the churn of an unparsable edit is 0, not a
+    dropped tool call."""
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args) if args else {}
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def _append_tool_use(st: _ParseState, line_num: int, ts: datetime | None,
-                     tool_name: str, tool_call_id: str) -> None:
+                     tool_name: str, tool_call_id: str,
+                     churn: tuple[int, int] = (0, 0)) -> None:
+    added, deleted = churn
     st.tool_uses.append({
         "file_key": st.file_key,
         "line_num": line_num,
@@ -196,6 +266,8 @@ def _append_tool_use(st: _ParseState, line_num: int, ts: datetime | None,
         "tool_name": tool_name,
         "tool_call_id": tool_call_id,
         "is_error": None,
+        "lines_added": added,
+        "lines_deleted": deleted,
     })
 
 
@@ -239,11 +311,15 @@ def _append_usage_record(st: _ParseState, line_num: int,
 
 def _resolve_tool_errors(tool_uses: list[dict],
                          tool_result_is_error: dict[str, bool]) -> None:
-    """Resolve tool_result.is_error onto each tool_uses entry."""
+    """Resolve tool_result.is_error onto each tool_uses entry, and zero the
+    line churn of calls that failed — a rejected edit changed no lines."""
     for tu in tool_uses:
         tc_id = tu.pop("tool_call_id", "")
         if tc_id and tc_id in tool_result_is_error:
             tu["is_error"] = tool_result_is_error[tc_id]
+            if tu["is_error"]:
+                tu["lines_added"] = 0
+                tu["lines_deleted"] = 0
 
 
 def _ctx_turns_from_turns(turns: list[dict], records: list[dict]) -> list[dict]:
@@ -316,9 +392,9 @@ def _legacy_content_part(st: _ParseState, payload: dict) -> None:
 def _legacy_tool_call(st: _ParseState, line_num: int, ts: datetime | None,
                       payload: dict) -> None:
     func = payload.get("function", {})
-    _append_tool_use(
-        st, line_num, ts, func.get("name", ""), payload.get("id", "")
-    )
+    name = func.get("name", "")
+    churn = _edit_churn(name, _args_to_dict(func.get("arguments")))
+    _append_tool_use(st, line_num, ts, name, payload.get("id", ""), churn)
     _mark_assistant_event(st)
 
 
@@ -469,10 +545,9 @@ def _kc_append_message(st: _ParseState, line_num: int, ts: datetime | None,
             msg.get("content") or []
         )
         for tc in msg.get("toolCalls") or []:
-            # The arguments are parsed but not persisted — the tool_uses
-            # table carries name and error state only.
-            name, _args, tcid = _kc_parse_tool_call(tc)
-            _append_tool_use(st, line_num, ts, name, tcid)
+            name, args, tcid = _kc_parse_tool_call(tc)
+            churn = _edit_churn(name, _args_to_dict(args))
+            _append_tool_use(st, line_num, ts, name, tcid, churn)
         _mark_assistant_event(st)
     elif role == "tool":
         tcid = msg.get("toolCallId", "")
@@ -501,9 +576,10 @@ def _kc_loop_event(st: _ParseState, line_num: int, ts: datetime | None,
             st.text_chars_since_turn += len(str(part.get("text", "")))
         _mark_assistant_event(st)
     elif et == "tool.call":
+        name = str(ev.get("name", ""))
+        churn = _edit_churn(name, _args_to_dict(ev.get("args")))
         _append_tool_use(
-            st, line_num, ts,
-            str(ev.get("name", "")), str(ev.get("toolCallId", "")),
+            st, line_num, ts, name, str(ev.get("toolCallId", "")), churn,
         )
         _mark_assistant_event(st)
     elif et == "tool.result":
