@@ -455,6 +455,15 @@ function backendDashToShape(b) {
     session_count: h.session_count || 0,
   })).filter(e => !isNaN(e.ts));
   if (!events.length) return null;
+  // Edit churn (issue #17): two positive series — lines added, lines
+  // deleted — bucketed server-side at bucket_s. The panels plot them with
+  // the same per-bin + cumulative treatment as the token series. Absent
+  // from the drag-drop fallback, which has no churn producer.
+  const churnEvents = (b.churn || []).map(c => ({
+    ts: Date.parse(c.ts),
+    lines_added: c.lines_added,
+    lines_deleted: c.lines_deleted,
+  })).filter(e => !isNaN(e.ts));
   const costByModel = (b.cost_by_model || []).reduce((acc, r) => {
     const key = short(r.model);
     acc[key] = (acc[key] || 0) + (r.cost_usd || 0);
@@ -500,6 +509,7 @@ function backendDashToShape(b) {
   return {
     events, limitHits, range: { start, end }, costByModel,
     costByProject: b.cost_by_project || [],
+    churnEvents,
     sessionsOverride: sessions,
     totalSessions: b.total_sessions,
     mainWUsage: b.main_w_usage,
@@ -687,7 +697,7 @@ function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashN
     events = [], limitHits = [], range: dataRange, costByModel: backendByModel,
     costByProject: backendByProject = [],
     sessionsOverride, totalSessions, mainWUsage, mainEmpty, subagentFiles,
-    subagentOnlySessions, responseSizes, ctxTraces, bucketS,
+    subagentOnlySessions, responseSizes, ctxTraces, bucketS, churnEvents,
   } = synth || {};
   // Placeholder window so the bin-size maths below stays finite pre-data.
   const range = dataRange || { start: Date.now() - 86400000, end: Date.now() };
@@ -785,6 +795,17 @@ function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashN
           valueKey="_t" color={window.dashboardCol.totalTokens} range={range} binMs={binMs} />
         <window.TimeSeriesPanel title="Cost (USD)"    events={events} valueKey="cost_usd"
           color={window.dashboardCol.costUSD} range={range} binMs={binMs} isCurrency />
+        {/* Lines added / deleted: two separate POSITIVE series (issue #17),
+            rendered exactly like the token panels. Only the backend payload
+            carries churn, so the drag-drop fallback skips these two. */}
+        {churnEvents && (
+        <window.TimeSeriesPanel title="Lines Added"   events={churnEvents} valueKey="lines_added"
+          color={window.dashboardCol.linesAdded} range={range} binMs={binMs} />
+        )}
+        {churnEvents && (
+        <window.TimeSeriesPanel title="Lines Deleted" events={churnEvents} valueKey="lines_deleted"
+          color={window.dashboardCol.linesDeleted} range={range} binMs={binMs} />
+        )}
       </div>
 
       <div className="dash-grid-2">

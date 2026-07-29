@@ -26,6 +26,8 @@ const COL = {
   cacheReadTokens:   'oklch(0.72 0.14 25)',
   totalTokens:       'oklch(0.78 0.14 245)',
   costUSD:           cssVar('--gold', 'oklch(0.85 0.14 90)'),
+  linesAdded:        '#44dd66',
+  linesDeleted:      '#ee4444',
 };
 
 // Kimi model palette — the fork shipped with the Claude model keys,
