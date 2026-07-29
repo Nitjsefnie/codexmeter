@@ -741,6 +741,72 @@ def test_tool_endpoints_rollup_matches_live_path(app_with_fresh_data, monkeypatc
     assert rolled_errors["buckets"] == live_errors["buckets"]
 
 
+def _insert_churn_probe_rows():
+    """Seed tool_uses rows with KNOWN edit churn at three recent hours.
+
+    Same SV-ROLLUP drill as _insert_tool_probe_rows: the rows are written
+    straight into tool_uses and the rollup is rebuilt by hand, because the
+    mini R2 mirror carries no tool calls at all. Totals: 60 added, 6
+    deleted (10*i / i for i in 1..3).
+    """
+    with _pg_cur() as cur:
+        cur.execute(
+            "INSERT INTO tool_uses (file_key, line_num, idx, ts, tool_name,"
+            " is_error, lines_added, lines_deleted) "
+            "SELECT f.file_key, 9500 + i, 0,"
+            "       date_trunc('hour', now()) - make_interval(hours => i),"
+            "       'Edit', FALSE, 10 * i, i "
+            "FROM files f, generate_series(1, 3) AS i "
+            "WHERE f.file_key = (SELECT MIN(file_key) FROM files)"
+        )
+
+    ingest.rebuild_tool_rollup()
+
+
+def test_dashboard_churn_rollup_and_live_paths_agree(app_with_fresh_data, monkeypatch):
+    """The churn series must be identical off tool_rollup (>= 1h buckets)
+    and off the live tool_uses subquery — the one dual-path source behind
+    both, same as the tool endpoints."""
+    _insert_churn_probe_rows()
+
+    body = app_with_fresh_data.get("/api/dashboard?range=3650d").json()
+    churn = body["churn"]
+    assert churn, "probe churn must reach /api/dashboard"
+    assert sum(c["lines_added"] for c in churn) == 60
+    assert sum(c["lines_deleted"] for c in churn) == 6
+
+    # Project filter applies (the probe rows hang off projA's file).
+    proj = app_with_fresh_data.get("/api/dashboard?range=3650d&project=projA").json()
+    assert sum(c["lines_added"] for c in proj["churn"]) == 60
+    other = app_with_fresh_data.get("/api/dashboard?range=3650d&project=projB").json()
+    assert sum(c["lines_added"] for c in other["churn"]) == 0
+
+    live_source = _tool_source(60)      # the live subquery branch
+    monkeypatch.setattr(api_dash_mod, "_tool_source", lambda bucket_s: live_source)
+    cache.response_cache.clear()
+    live = app_with_fresh_data.get("/api/dashboard?range=3650d").json()
+    assert live["churn"] == churn
+
+
+def test_dashboard_churn_subhour_range_reads_live_tool_uses(app_with_fresh_data):
+    """The 24h view buckets below tool_rollup's hourly grain, so its churn
+    comes from the live subquery — exercise that branch for real."""
+    _insert_churn_probe_rows()
+
+    body = app_with_fresh_data.get("/api/dashboard?range=1d").json()
+    assert body["bucket_s"] < 3600, "1d must bucket below the rollup grain"
+    assert sum(c["lines_added"] for c in body["churn"]) == 60
+    assert sum(c["lines_deleted"] for c in body["churn"]) == 6
+
+
+def test_dashboard_churn_empty_without_tool_rows(app_with_data):
+    """No-churn case: the mini R2 mirror produces no tool_uses, so the
+    series is present but empty — the panels render a flat zero, not an
+    error."""
+    body = app_with_data.get("/api/dashboard?range=all").json()
+    assert body["churn"] == []
+
+
 def test_dashboard_model_filter_does_not_500(app_with_data):
     """?model= must filter, not raise.
 

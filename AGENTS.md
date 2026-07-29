@@ -84,6 +84,13 @@
     display buckets >= 1h. The 24h view buckets at 5 minutes and takes a
     live subquery shaped with the same column names — keep both paths
     behind one set of queries so they cannot drift.
+  - `tool_uses` / `tool_rollup` also carry `lines_added` / `lines_deleted`
+    — edit churn derived at parse time from Edit/Write (kimi-code) and
+    StrReplaceFile/WriteFile (legacy) call ARGS, because the wire's tool
+    results carry no diff. /api/dashboard serves them as the `churn`
+    series behind the Lines Added/Deleted panels. tool_uses has no model
+    dimension, so `?model=` does not filter churn (same caveat as the
+    tool endpoints).
 - **Don't invoke `~/.kimi-code/scripts/parse_wire.py`** at runtime, and
   don't edit it from this repo. If the canonical Python and our port
   drift, fix it here, not there.

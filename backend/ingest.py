@@ -446,7 +446,9 @@ def rebuild_tool_rollup() -> int:
 
     n_total counts every tool call (/api/tool-usage), n_rated only the
     settled ones (/api/tool-error-rate's denominator), so one table serves
-    both without either having to approximate the other.
+    both without either having to approximate the other. lines_added /
+    lines_deleted are the parse-time edit churn sums behind
+    /api/dashboard's Lines Added/Deleted panels.
     """
     with db.viz_conn() as c:
         c.execute("SET LOCAL work_mem = '64MB'")
@@ -460,14 +462,17 @@ def rebuild_tool_rollup() -> int:
         cur = c.execute(
             """
             INSERT INTO tool_rollup (
-              hour, project_id, tool_name, n_total, n_rated, n_error
+              hour, project_id, tool_name, n_total, n_rated, n_error,
+              lines_added, lines_deleted
             )
             SELECT date_trunc('hour', tu.ts) AS hour,
                    f.project_id,
                    tu.tool_name,
                    COUNT(*)                                       AS n_total,
                    COUNT(*) FILTER (WHERE tu.is_error IS NOT NULL) AS n_rated,
-                   COUNT(*) FILTER (WHERE tu.is_error)             AS n_error
+                   COUNT(*) FILTER (WHERE tu.is_error)             AS n_error,
+                   COALESCE(SUM(tu.lines_added), 0)               AS lines_added,
+                   COALESCE(SUM(tu.lines_deleted), 0)             AS lines_deleted
               FROM tool_uses tu
               JOIN files f ON f.file_key = tu.file_key
              WHERE tu.ts IS NOT NULL
@@ -865,8 +870,10 @@ def _persist(obj, proj, project_id, session_id, is_main, parsed,
         if parsed.get("tool_uses"):
             cur.executemany(
                 """
-                INSERT INTO tool_uses (file_key, line_num, idx, ts, tool_name, is_error)
-                VALUES (%(file_key)s, %(line_num)s, %(idx)s, %(ts)s, %(tool_name)s, %(is_error)s)
+                INSERT INTO tool_uses (file_key, line_num, idx, ts, tool_name,
+                  is_error, lines_added, lines_deleted)
+                VALUES (%(file_key)s, %(line_num)s, %(idx)s, %(ts)s, %(tool_name)s,
+                  %(is_error)s, %(lines_added)s, %(lines_deleted)s)
                 """,
                 parsed["tool_uses"],
             )

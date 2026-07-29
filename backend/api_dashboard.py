@@ -21,6 +21,8 @@ from backend.api import (
     _parse_range,
     _proj_filter,
     _proj_rollup,
+    _proj_tool,
+    _tool_source,
 )
 from backend.cache import cache_response
 
@@ -51,6 +53,7 @@ class _DashRows(NamedTuple):
     sessions: list
     ctx_traces: list
     rate_limits: list
+    churn: list
 
 
 def _base_cte(proj_filter: str, model_filter: str) -> str:
@@ -384,10 +387,34 @@ def _dash_rows(q: _DashQuery, ph: Phases) -> _DashRows:
             rl_args,
         ).fetchall()
 
+        # Lines added/deleted per bucket — two separate POSITIVE series
+        # (issue #17), read off the same dual-path tool source as the tool
+        # endpoints: tool_rollup at >= 1h buckets, the live tool_uses
+        # subquery below that. No model dimension exists on tool_uses
+        # (its line_nums are disjoint from records'), so ?model= does not
+        # constrain this series — same caveat the tool endpoints carry.
+        churn_args: list[Any] = [q.args[0]]  # since
+        churn_proj = _proj_tool(q.project, churn_args)
+        churn_rows = ph.execute(
+            "churn", c,
+            db.sql_literal(f"""
+            SELECT to_timestamp(
+                     floor(EXTRACT(EPOCH FROM t.hour) / {q.bucket_s}) * {q.bucket_s} + {q.bucket_s} / 2
+                   ) AS bucket,
+                   SUM(t.lines_added)   AS lines_added,
+                   SUM(t.lines_deleted) AS lines_deleted
+            FROM {_tool_source(q.bucket_s)}
+            WHERE t.hour >= %s {churn_proj}
+            GROUP BY 1
+            ORDER BY 1
+            """),
+            churn_args,
+        ).fetchall()
+
     return _DashRows(
         hourly_rows, response_sizes_rows, total_sessions,
         cost_by_project_rows, file_counts, sessions_rows, ctx_traces_rows,
-        rl_rows,
+        rl_rows, churn_rows,
     )
 
 
@@ -498,6 +525,19 @@ def _dash_rate_limits(rl_rows: list) -> list:
     return rate_limit_hits
 
 
+def _dash_churn(churn_rows: list) -> list:
+    """Bucketed edit churn — lines added / lines deleted as two separate
+    positive series, the same per-bucket shape the token panels plot."""
+    return [
+        {
+            "ts": _iso(bucket),
+            "lines_added": int(added or 0),
+            "lines_deleted": int(deleted or 0),
+        }
+        for (bucket, added, deleted) in churn_rows
+    ]
+
+
 def _dash_payload(q: _DashQuery, rows: _DashRows) -> dict:
     hourly = _dash_hourly(rows.hourly)
     # ctx_turns used to be its own query, but it is a strict subset of
@@ -518,6 +558,7 @@ def _dash_payload(q: _DashQuery, rows: _DashRows) -> dict:
         "cost_by_model": _dash_cost_by_model(hourly),
         "cost_by_project": _dash_cost_by_project(rows.cost_by_project),
         "rate_limit_hits": _dash_rate_limits(rows.rate_limits),
+        "churn": _dash_churn(rows.churn),
         "sessions": _dash_sessions(rows.sessions, ctx_turns_by_session),
         "total_sessions": rows.total_sessions,
         "main_w_usage": main_w_usage,

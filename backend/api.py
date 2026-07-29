@@ -172,7 +172,8 @@ def _tool_source(bucket_s: int) -> str:
       SELECT tu.ts AS hour, f.project_id, tu.tool_name,
              1::bigint AS n_total,
              (CASE WHEN tu.is_error IS NOT NULL THEN 1 ELSE 0 END)::bigint AS n_rated,
-             (CASE WHEN tu.is_error THEN 1 ELSE 0 END)::bigint            AS n_error
+             (CASE WHEN tu.is_error THEN 1 ELSE 0 END)::bigint            AS n_error,
+             tu.lines_added, tu.lines_deleted
         FROM tool_uses tu
         JOIN files f ON f.file_key = tu.file_key
        WHERE tu.ts IS NOT NULL

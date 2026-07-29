@@ -119,6 +119,8 @@ CREATE TABLE IF NOT EXISTS tool_rollup (
   n_total     BIGINT      NOT NULL DEFAULT 0,
   n_rated     BIGINT      NOT NULL DEFAULT 0,
   n_error     BIGINT      NOT NULL DEFAULT 0,
+  lines_added   BIGINT    NOT NULL DEFAULT 0,
+  lines_deleted BIGINT    NOT NULL DEFAULT 0,
   PRIMARY KEY (hour, project_id, tool_name)
 );
 CREATE INDEX IF NOT EXISTS tool_rollup_hour_idx ON tool_rollup (hour);
@@ -181,8 +183,25 @@ CREATE TABLE IF NOT EXISTS tool_uses (
   ts         TIMESTAMPTZ,
   tool_name  TEXT NOT NULL,
   is_error   BOOLEAN,
+  lines_added   BIGINT NOT NULL DEFAULT 0,
+  lines_deleted BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (file_key, line_num, idx)
 );
+
+-- Idempotent migration for existing DBs. Line churn rides tool_uses
+-- (same grain: one row per tool call) and tool_rollup (the hourly sums
+-- /api/dashboard's Lines Added/Deleted panels read). Populated at parse
+-- time from edit/write tool-call args — the wire's tool results carry
+-- no diff — so historical rows stay 0 until a PARSER_VERSION bump
+-- reparses them.
+ALTER TABLE tool_uses ADD COLUMN IF NOT EXISTS
+  lines_added BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE tool_uses ADD COLUMN IF NOT EXISTS
+  lines_deleted BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE tool_rollup ADD COLUMN IF NOT EXISTS
+  lines_added BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE tool_rollup ADD COLUMN IF NOT EXISTS
+  lines_deleted BIGINT NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS tool_uses_ts_idx   ON tool_uses (ts);
 CREATE INDEX IF NOT EXISTS tool_uses_tool_idx ON tool_uses (tool_name);

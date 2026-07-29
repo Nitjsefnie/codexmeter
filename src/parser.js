@@ -4,7 +4,7 @@
  */
 
 // Must match backend PARSER_VERSION (see backend/.env.example).
-window.PARSER_VERSION = "6";
+window.PARSER_VERSION = "8";
 
 const MODEL_RATES = {
   "kimi-k3":        { fresh: 3.00, create: 0.00, read: 0.30, output: 15.00 },

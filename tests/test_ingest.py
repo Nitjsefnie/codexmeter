@@ -172,6 +172,40 @@ def test_no_changes_second_run_is_zero_reparse(fresh_db, mini_r2_env):
     assert result2["reparsed"] == 0
 
 
+def test_edit_churn_persisted_and_rolled_up(fresh_db, mini_r2_env):
+    """End to end: a wire.jsonl whose Edit/Write calls carry known churn
+    lands in tool_uses, and rebuild_tool_rollup sums it. The fixture is
+    the parser's own line_churn_kimi_code.jsonl: Edit 4+/3-, Write 2+/0-,
+    plus an errored Edit that must contribute nothing."""
+    target_dir = mini_r2_env / "sessions" / "projA" / "sess-churn"
+    target_dir.mkdir(parents=True)
+    shutil.copy(
+        _REPO_ROOT / "fixtures/parser/line_churn_kimi_code.jsonl",
+        target_dir / "wire.jsonl",
+    )
+    result = ingest.run_ingest(trigger="manual")
+    assert result["error"] is None
+    with db.viz_conn() as c:
+        rows = c.execute(
+            "SELECT tool_name, is_error, lines_added, lines_deleted "
+            "FROM tool_uses WHERE file_key LIKE '%sess-churn/wire.jsonl' "
+            "ORDER BY line_num"
+        ).fetchall()
+        assert rows == [
+            ("Edit", False, 4, 3),
+            ("Write", False, 2, 0),
+            ("Edit", True, 0, 0),
+            ("Bash", False, 0, 0),
+        ]
+        added = _scalar(
+            c, "SELECT COALESCE(SUM(lines_added), 0) FROM tool_rollup"
+        )
+        deleted = _scalar(
+            c, "SELECT COALESCE(SUM(lines_deleted), 0) FROM tool_rollup"
+        )
+        assert (added, deleted) == (6, 3)
+
+
 def test_is_canonical_matches_read_time_distinct_on(fresh_db, mini_r2_env):
     """The ingest-time flag must select exactly the rows the old read-time
     `DISTINCT ON (uuid) ORDER BY uuid, file_key` would have kept.
