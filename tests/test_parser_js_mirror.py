@@ -21,7 +21,7 @@ Two directions are covered, because either one alone leaves a hole:
     while the tables still agree, which is the case that actually bit.
 
 claudit's copy of this test also pins the dated-rate epochs
-(test_parser_js_exposes_the_same_rate_epochs). kimimeter has no dated rates —
+(test_parser_js_exposes_the_same_rate_epochs). codexmeter has no dated rates —
 no DATED_RATES, no RATE_EPOCHS on either side — so that test has no analogue
 here and is deliberately not ported rather than invented.
 """

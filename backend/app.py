@@ -1,4 +1,4 @@
-"""FastAPI entrypoint for kimimeter."""
+"""FastAPI entrypoint for codexmeter."""
 from __future__ import annotations
 
 import asyncio
@@ -56,7 +56,7 @@ async def lifespan(fastapi_app: FastAPI):
 
 
 app = FastAPI(
-    title="kimimeter",
+    title="codexmeter",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,

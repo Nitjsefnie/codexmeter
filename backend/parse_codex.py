@@ -204,7 +204,7 @@ def _codex_record_uuid(st: _CodexState, cumulative: dict,
     only 12,945 distinct requests, and one session id spans 39 files.
     Aggregating those per-file rows without dedup over-counts by ~2.2x.
 
-    kimimeter already solved this — `records.uuid` plus `is_canonical`,
+    codexmeter already solved this — `records.uuid` plus `is_canonical`,
     resolved by ingest.recompute_canonical(), which keeps exactly one row
     per uuid. What that mechanism needs from a parser is a uuid that is
     IDENTICAL across every file replaying a given request, which

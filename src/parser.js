@@ -703,10 +703,10 @@ window.parseTranscript = function parseTranscript(blob) {
   return _parseLegacy(blob);
 };
 
-// Per-call context-window input, kimimeter shape: a status_update's
+// Per-call context-window input, codexmeter shape: a status_update's
 // token_usage. Claudit's version summed input_tokens + cache_creation +
 // cache_read and took the peak across usage.iterations (sub-agent fan-out);
-// kimimeter's wire format has no iterations concept anywhere, so there is
+// codexmeter's wire format has no iterations concept anywhere, so there is
 // no peak branch here. Defensive: a missing or non-numeric field
 // contributes 0, never NaN.
 window.usageCtxInput = function usageCtxInput(u) {
@@ -752,9 +752,9 @@ window.asUsageRecord = function asUsageRecord(m, fallbackTs) {
 };
 
 // SessionHeader's stats, as an OBJECT. Ported from claudit's
-// computeSessionStats onto kimimeter's parsed shapes: claudit read
+// computeSessionStats onto codexmeter's parsed shapes: claudit read
 // meta type "assistant_usage" with usage.{input,cache_creation,cache_read,
-// output}_tokens; kimimeter's parser emits type "status_update" with
+// output}_tokens; codexmeter's parser emits type "status_update" with
 // token_usage.{input_other,input_cache_creation,input_cache_read,output}
 // plus a wire_model, and event timestamps in epoch seconds (or ISO
 // strings for legacy), which parseTimestamp normalises. Usage records are

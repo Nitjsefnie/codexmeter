@@ -381,7 +381,7 @@ def test_a_fragment_with_no_session_meta_falls_back_to_per_file_identity():
 
 
 def test_reasoning_tokens_are_carried_not_dropped():
-    """Codex breaks its output down into reasoning and the rest. kimimeter
+    """Codex breaks its output down into reasoning and the rest. codexmeter
     has no such column, which is not a reason to discard the count."""
     out = _parse("rollout_fork_prefix.jsonl")
     assert any(r["reasoning_output_tokens"] > 0 for r in out["records"])

@@ -1,6 +1,6 @@
 """Per-model cost rates (USD per million tokens).
 
-SINGLE SOURCE OF TRUTH for cost in kimimeter.
+SINGLE SOURCE OF TRUTH for cost in codexmeter.
 Bump PARSER_VERSION when this table changes — every session reparses.
 
 Kimi wire format token categories:
@@ -35,7 +35,7 @@ Two resolution behaviours matter, in priority order:
    rather than presenting it as fact.
 
 claudit's middle rung (TIER — an unrecognised model falls back to its
-family's current rates) has no kimimeter analogue: a kimi id carries no
+family's current rates) has no codexmeter analogue: a kimi id carries no
 family name to fall back on, and inventing one generation's rates for an
 unknown id is exactly the silent mispricing rung 1 exists to prevent. The
 kind vocabulary still reserves "tier" so the two repos agree on the field.

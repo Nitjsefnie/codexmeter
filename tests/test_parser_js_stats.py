@@ -15,7 +15,7 @@ approach as test_parser_js_mirror.py). They pin:
   * its values on a hand-built status_update/token_usage fixture, with the
     cost worked out by hand from the kimi-k3 rates so a pricing regression
     cannot hide behind a re-derived expectation;
-  * usageCtxInput's sum over kimimeter's three input buckets and its
+  * usageCtxInput's sum over codexmeter's three input buckets and its
     no-NaN behaviour on missing/odd fields;
   * the batch_size/batch_index annotation the parser adds when one
     assistant message carries several toolCalls — the wire format's only

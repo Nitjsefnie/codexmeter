@@ -1,4 +1,4 @@
-# Contributing to kimimeter
+# Contributing to codexmeter
 
 Issues and pull requests are welcome — especially if your numbers disagree
 with ours. This project is a cost- and usage-accounting tool, so a report
@@ -117,7 +117,7 @@ know a reparse is coming.
 
 ## Licensing
 
-kimimeter is MIT (see [`LICENSE`](LICENSE)). If a future change vendors
+codexmeter is MIT (see [`LICENSE`](LICENSE)). If a future change vendors
 third-party code, reproduce its notice in a separate `NOTICE` file rather
 than appending it to `LICENSE`, which makes GitHub misclassify the
 project.
