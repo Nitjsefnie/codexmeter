@@ -36,6 +36,13 @@ CREATE TABLE IF NOT EXISTS records (
   cache_creation_tokens   BIGINT NOT NULL DEFAULT 0,   -- input_cache_creation
   cache_read_tokens       BIGINT NOT NULL DEFAULT 0,   -- input_cache_read
   output_tokens           BIGINT NOT NULL DEFAULT 0,
+  -- SUBSET of output_tokens, not an addend: the part of the response the
+  -- model spent thinking. Codex reports it (reasoning_output_tokens); the
+  -- Kimi wire formats do not carry it and store 0. Token types are NOT
+  -- required to match across providers — if a format carries one, it is
+  -- counted and surfaced rather than folded away, and a format that lacks
+  -- one stores zero rather than having a value invented for it.
+  reasoning_output_tokens BIGINT NOT NULL DEFAULT 0,
   cost_usd                NUMERIC(12,6) NOT NULL DEFAULT 0,
   text_chars              BIGINT NOT NULL DEFAULT 0,
   reply_latency_s         NUMERIC(10,3),
@@ -47,6 +54,11 @@ ALTER TABLE records ADD COLUMN IF NOT EXISTS
   text_chars BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE records ADD COLUMN IF NOT EXISTS
   reply_latency_s NUMERIC(10,3);
+-- Defaults to 0, which is exactly right for every already-ingested Kimi
+-- row: that format carries no reasoning count, so 0 is the true value
+-- rather than a placeholder awaiting a reparse.
+ALTER TABLE records ADD COLUMN IF NOT EXISTS
+  reasoning_output_tokens BIGINT NOT NULL DEFAULT 0;
 
 -- Cross-file uuid dedup, resolved at INGEST instead of on every read.
 -- `records` is immutable between ingests, but every read endpoint was
@@ -90,9 +102,25 @@ CREATE TABLE IF NOT EXISTS usage_rollup (
   fresh_tokens        BIGINT      NOT NULL DEFAULT 0,
   output_tokens       BIGINT      NOT NULL DEFAULT 0,
   cache_read_tokens   BIGINT      NOT NULL DEFAULT 0,
+  -- Subset of output_tokens (see records.reasoning_output_tokens). Summed
+  -- here rather than derived on read, so the reasoning share of a range is
+  -- one column read instead of a scan over records.
+  reasoning_output_tokens BIGINT  NOT NULL DEFAULT 0,
+  cache_write_tokens  BIGINT      NOT NULL DEFAULT 0,
   cost_usd            NUMERIC(18,8) NOT NULL DEFAULT 0,
   PRIMARY KEY (session_id, hour, model, is_main)
 );
+
+-- Idempotent migration for existing DBs.
+--
+-- cache_write_tokens was never rolled up because the Kimi formats bill
+-- cache creation at zero and always reported 0. Codex bills cache writes
+-- at 1.25x uncached input, so the bucket is real money there and has to
+-- survive the rollup rather than being visible only in `records`.
+ALTER TABLE usage_rollup ADD COLUMN IF NOT EXISTS
+  reasoning_output_tokens BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE usage_rollup ADD COLUMN IF NOT EXISTS
+  cache_write_tokens BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS usage_rollup_hour_idx ON usage_rollup (hour);
 CREATE INDEX IF NOT EXISTS usage_rollup_project_idx ON usage_rollup (project_id, hour);
 

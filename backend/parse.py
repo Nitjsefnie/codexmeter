@@ -1,22 +1,32 @@
-"""wire.jsonl → per-file (records list + ctx_turns array).
+"""transcript → per-file (records list + ctx_turns array).
 
-Each call to parse_file processes ONE wire.jsonl. Cross-file uuid dedup is a
-query-time concern (DISTINCT ON (uuid) in the read endpoints).
+Each call to parse_file processes ONE transcript file, in whichever of the
+three supported formats it is written: legacy kimi-cli wire.jsonl, kimi-code
+wire.jsonl, or a Codex rollout JSONL. Cross-file uuid dedup is a query-time
+concern (DISTINCT ON (uuid) in the read endpoints).
 
-Cost is precomputed per-record using pricing.MODEL_RATES so the
-read path doesn't need to JOIN against rates. Bumps to the rate
-table OR to the parse algorithm both require a PARSER_VERSION
-bump to invalidate every files row.
+This module owns format DETECTION, the two Kimi formats, and the Kimi model
+ladder. The Codex format lives in backend/parse_codex.py and the machinery
+all three share in backend/parse_common.py.
+
+Cost is precomputed per-record using the pricing module's rate tables so the
+read path doesn't need to JOIN against rates. Bumps to a rate table OR to the
+parse algorithm both require a PARSER_VERSION bump to invalidate every files
+row.
 """
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import orjson
 
-from backend import pricing
+from backend import parse_codex
+from backend.parse_common import (_append_tool_use, _append_usage_record,
+                                  _close_turn, _end_turn, _finish_parse,
+                                  _line_count, _mark_assistant_event,
+                                  _ParseState, _start_turn, _to_dt,
+                                  _turn_boundary)
 
 # Model attribution, oldest first. Each constant is a frozen UTC epoch, NOT a
 # live expression.
@@ -102,100 +112,6 @@ def _model_for(wire_model: str | None, ts: datetime | None) -> str:
     return "kimi-k3"
 
 
-def _to_dt(s: str | float | None):
-    if not s:
-        return None
-    if isinstance(s, (int, float)):
-        return datetime.fromtimestamp(s, tz=datetime.now().astimezone().tzinfo)
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
-
-
-@dataclass
-class _ParseState:
-    """Mutable per-file parse state threaded through the message handlers.
-
-    turns entries are {begin_line, begin_ts, end_line, end_ts,
-    status_lines: [line_num]}; records entries carry the keys documented
-    on parse_file plus an internal ctx_input used to build ctx_turns.
-    """
-    file_key: str
-    records: list[dict] = field(default_factory=list)
-    tool_uses: list[dict] = field(default_factory=list)
-    rate_limit_hits: list[dict] = field(default_factory=list)
-    # Per-file map of tool_call_id -> bool(is_error)
-    tool_result_is_error: dict[str, bool] = field(default_factory=dict)
-    turns: list[dict] = field(default_factory=list)
-    current_turn: dict | None = None
-    current_turn_id: str | None = None
-    # For reply latency: track TurnBegin ts, then find first assistant event
-    pending_turn_begin_ts: datetime | None = None
-    turn_has_assistant_event: bool = False
-    # For text_chars: accumulate ContentPart.text since last TurnBegin
-    text_chars_since_turn: int = 0
-    # First event timestamp drives the per-session model label.
-    first_event_ts: datetime | None = None
-
-
-def _close_turn(st: _ParseState, line_num: int, ts: datetime | None) -> None:
-    if st.current_turn is not None:
-        st.current_turn["end_line"] = line_num
-        st.current_turn["end_ts"] = ts
-        st.turns.append(st.current_turn)
-        st.current_turn = None
-
-
-def _start_turn(st: _ParseState, line_num: int, ts: datetime | None) -> None:
-    st.current_turn = {
-        "begin_line": line_num,
-        "begin_ts": ts,
-        "end_line": None,
-        "end_ts": None,
-        "status_lines": [],
-    }
-    st.turn_has_assistant_event = False
-    st.text_chars_since_turn = 0
-
-
-def _turn_boundary(st: _ParseState, line_num: int, ts: datetime | None) -> None:
-    """Close any open turn, open the next, and arm the reply-latency anchor."""
-    _close_turn(st, line_num, ts)
-    _start_turn(st, line_num, ts)
-    st.pending_turn_begin_ts = ts
-
-
-def _mark_assistant_event(st: _ParseState) -> None:
-    if not st.turn_has_assistant_event and st.pending_turn_begin_ts is not None:
-        st.turn_has_assistant_event = True
-
-
-def _consume_reply_latency(st: _ParseState, ts: datetime | None) -> float | None:
-    """Gap from the turn's anchor to this record, if the anchor is open.
-
-    The anchor is consumed either way: one reply latency per turn, taken
-    from its first billing record.
-    """
-    latency = None
-    if st.pending_turn_begin_ts is not None and ts is not None:
-        delta_s = (ts - st.pending_turn_begin_ts).total_seconds()
-        if delta_s >= 0:
-            latency = delta_s
-    st.pending_turn_begin_ts = None
-    return latency
-
-
-def _line_count(text: object) -> int:
-    """Lines in an edit-payload string. A trailing newline terminates the
-    last line rather than starting another, so "a\n" is 1 line; a final
-    partial line still counts, so "a\nb" is 2."""
-    if not isinstance(text, str) or not text:
-        return 0
-    n = text.count("\n")
-    return n if text.endswith("\n") else n + 1
-
-
 def _edit_churn(tool_name: str, args: dict) -> tuple[int, int]:
     """(lines_added, lines_deleted) for ONE file-mutating tool call.
 
@@ -254,132 +170,9 @@ def _args_to_dict(args) -> dict:
     return {}
 
 
-def _append_tool_use(st: _ParseState, line_num: int, ts: datetime | None,
-                     tool_name: str, tool_call_id: str,
-                     churn: tuple[int, int] = (0, 0)) -> None:
-    added, deleted = churn
-    st.tool_uses.append({
-        "file_key": st.file_key,
-        "line_num": line_num,
-        "idx": len(st.tool_uses),
-        "ts": ts,
-        "tool_name": tool_name,
-        "tool_call_id": tool_call_id,
-        "is_error": None,
-        "lines_added": added,
-        "lines_deleted": deleted,
-    })
-
-
-def _append_usage_record(st: _ParseState, line_num: int,
-                         ts: datetime | None, uuid: str | None,
-                         wire_model: str | None, toks: tuple[int, int, int, int]
-                         ) -> None:
-    """Build one billing record from its token counts and append it.
-
-    The model is resolved per-record (a session can switch model
-    mid-flight): the wire id wins when it settles the model
-    unambiguously, dates decide only what the wire cannot express.
-    first_event_ts is the fallback for a record with no timestamp of its
-    own.
-    """
-    fresh, create, read, output = toks
-    latency = _consume_reply_latency(st, ts)
-    model = _model_for(wire_model, ts or st.first_event_ts)
-    cost = pricing.compute_cost(
-        model,
-        fresh=fresh, create=create, read=read, output=output,
-    )
-    st.records.append({
-        "file_key": st.file_key,
-        "line_num": line_num,
-        "uuid": uuid,
-        "ts": ts,
-        "model": model,
-        "fresh_tokens": fresh,
-        "cache_creation_tokens": create,
-        "cache_read_tokens": read,
-        "output_tokens": output,
-        "cost_usd": round(cost, 6),
-        "text_chars": st.text_chars_since_turn,
-        "reply_latency_s": latency,
-        "ctx_input": fresh + create + read,
-    })
-    if st.current_turn is not None:
-        st.current_turn["status_lines"].append(line_num)
-
-
-def _resolve_tool_errors(tool_uses: list[dict],
-                         tool_result_is_error: dict[str, bool]) -> None:
-    """Resolve tool_result.is_error onto each tool_uses entry, and zero the
-    line churn of calls that failed — a rejected edit changed no lines."""
-    for tu in tool_uses:
-        tc_id = tu.pop("tool_call_id", "")
-        if tc_id and tc_id in tool_result_is_error:
-            tu["is_error"] = tool_result_is_error[tc_id]
-            if tu["is_error"]:
-                tu["lines_added"] = 0
-                tu["lines_deleted"] = 0
-
-
-def _ctx_turns_from_turns(turns: list[dict], records: list[dict]) -> list[dict]:
-    """Build ctx_turns from turns + records.
-
-    The last StatusUpdate/usage.record in each turn is the canonical one.
-    """
-    rec_by_line = {r["line_num"]: r for r in records}
-    ctx_turns: list[dict] = []
-    prev_input = 0
-    turn_idx = 0
-    for turn in turns:
-        if not turn["status_lines"]:
-            continue
-        last_line = turn["status_lines"][-1]
-        rec = rec_by_line.get(last_line)
-        if not rec or rec["ctx_input"] <= 0:
-            continue
-        turn_idx += 1
-        ctx_input = rec["ctx_input"]
-        ctx_turns.append({
-            "idx": turn_idx,
-            "ts": rec["ts"].isoformat() if rec["ts"] else "",
-            "line": last_line,
-            "input": ctx_input,
-            "output": rec["output_tokens"],
-            "delta": ctx_input - prev_input,
-        })
-        prev_input = ctx_input
-    return ctx_turns
-
-
-def _finish_parse(st: _ParseState, end_line: int | None = None) -> dict:
-    """Shared tail for both formats: close any dangling turn, settle the
-    tool-call is_error flags, and build ctx_turns from the turns."""
-    if end_line is not None:
-        _close_turn(st, end_line, None)
-    elif st.current_turn is not None:
-        st.turns.append(st.current_turn)
-    _resolve_tool_errors(st.tool_uses, st.tool_result_is_error)
-    ctx_turns = _ctx_turns_from_turns(st.turns, st.records)
-    return {
-        "records": st.records,
-        "ctx_turns": ctx_turns,
-        "turn_count": len(ctx_turns),
-        "rate_limit_hits": st.rate_limit_hits,
-        "tool_uses": st.tool_uses,
-    }
-
-
 # --------------------------------------------------------------------------
 # Legacy kimi-cli format
 # --------------------------------------------------------------------------
-
-
-def _legacy_turn_end(st: _ParseState, line_num: int,
-                     ts: datetime | None) -> None:
-    if st.current_turn is not None:
-        _close_turn(st, line_num, ts)
-        st.pending_turn_begin_ts = None
 
 
 def _legacy_content_part(st: _ParseState, payload: dict) -> None:
@@ -426,7 +219,8 @@ def _legacy_status_update(st: _ParseState, line_num: int,
     # own ts so a session spanning a cutoff splits correctly;
     # first_event_ts is only the fallback for a record with no timestamp.
     _append_usage_record(
-        st, line_num, ts, payload.get("message_id") or None, None, toks
+        st, line_num, ts, payload.get("message_id") or None,
+        _model_for(None, ts or st.first_event_ts), toks,
     )
 
 
@@ -435,7 +229,7 @@ def _legacy_dispatch(st: _ParseState, msg_type: str, line_num: int,
     if msg_type == "TurnBegin":
         _turn_boundary(st, line_num, ts)
     elif msg_type == "TurnEnd":
-        _legacy_turn_end(st, line_num, ts)
+        _end_turn(st, line_num, ts)
     elif msg_type == "ContentPart":
         _legacy_content_part(st, payload)
     elif msg_type == "ToolCall":
@@ -606,7 +400,8 @@ def _kc_usage_record(st: _ParseState, line_num: int, ts: datetime | None,
     # corpus, values "kimi-code/k3" and "kimi-code/kimi-for-coding").
     # Honour it; dates decide only what the wire cannot express.
     _append_usage_record(
-        st, line_num, ts, f"{st.file_key}:{line_num}", obj.get("model"), toks
+        st, line_num, ts, f"{st.file_key}:{line_num}",
+        _model_for(obj.get("model"), ts or st.first_event_ts), toks,
     )
 
 
@@ -679,9 +474,9 @@ def _parse_kimi_code(file_key: str, blob: bytes) -> dict:
 
 
 def parse_file(file_key: str, blob: bytes) -> dict:
-    """Parse one wire.jsonl. Returns {records, ctx_turns, turn_count, rate_limit_hits, tool_uses}.
+    """Parse one transcript. Returns {records, ctx_turns, turn_count, rate_limit_hits, tool_uses}.
 
-    Auto-detects legacy kimi-cli format vs new kimi-code format per file.
+    Auto-detects legacy kimi-cli, kimi-code and Codex rollout format per file.
     records: list of dicts with keys
       file_key, line_num, uuid, ts, model,
       fresh_tokens, cache_creation_tokens, cache_read_tokens,
@@ -700,6 +495,15 @@ def parse_file(file_key: str, blob: bytes) -> dict:
             continue
         if not isinstance(obj, dict):
             continue
+        # Codex first: its records also carry a "timestamp", so a later rung
+        # must not claim one. The pairing of a Codex record type with a dict
+        # payload is what identifies the format — "type" alone collides with
+        # nothing here, but a bare event_msg with no payload would be a
+        # truncated line rather than evidence.
+        if obj.get("type") in parse_codex.RECORD_TYPES and isinstance(
+                obj.get("payload"), dict):
+            fmt = "codex"
+            break
         if obj.get("type") == "metadata":
             fmt = "kimi-code" if "created_at" in obj else "legacy"
             break
@@ -718,6 +522,8 @@ def parse_file(file_key: str, blob: bytes) -> dict:
             fmt = "legacy"
             break
 
+    if fmt == "codex":
+        return parse_codex.parse(file_key, blob)
     if fmt == "kimi-code":
         return _parse_kimi_code(file_key, blob)
     return _parse_legacy(file_key, blob)

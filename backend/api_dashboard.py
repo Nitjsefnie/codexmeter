@@ -108,7 +108,13 @@ def _roll_source(bucket_s: int, since: datetime, project: str | None,
                  COALESCE(NULLIF(r.model, ''), 'unknown') AS model,
                  1::bigint AS requests,
                  r.fresh_tokens, r.output_tokens,
-                 r.cache_read_tokens, r.cost_usd
+                 r.cache_read_tokens, r.cost_usd,
+                 -- Same column NAMES as usage_rollup, so every query past
+                 -- this point is written once. cache_creation_tokens is
+                 -- what a record calls the bucket the rollup calls
+                 -- cache_write_tokens.
+                 r.reasoning_output_tokens,
+                 r.cache_creation_tokens AS cache_write_tokens
             FROM records r
             JOIN files f ON f.file_key = r.file_key
            WHERE r.is_canonical AND r.ts IS NOT NULL
@@ -162,6 +168,11 @@ def _dash_rows(q: _DashQuery, ph: Phases) -> _DashRows:
                    SUM(u.fresh_tokens)      AS input_tokens,
                    SUM(u.output_tokens)     AS output_tokens,
                    SUM(u.cache_read_tokens) AS cache_read_tokens,
+                   -- Selected unconditionally, rendered conditionally:
+                   -- _drop_zero_token_types removes whichever of these
+                   -- sums to zero over the range in view.
+                   SUM(u.reasoning_output_tokens) AS reasoning_output_tokens,
+                   SUM(u.cache_write_tokens)      AS cache_write_tokens,
                    SUM(u.cost_usd)          AS cost_usd,
                    SUM(u.requests)          AS requests,
                    COUNT(DISTINCT u.session_id) AS session_count
@@ -435,13 +446,70 @@ def _dash_cost_by_model(hourly: list) -> list:
     )
 
 
+# Every token type a record can carry, by payload key. Membership here is
+# what makes a field subject to zero-suppression below — it is a property
+# of BEING a token type, not a special case for any one of them.
+#
+# Providers do not agree on this list and are not required to: Codex breaks
+# its output into reasoning and the rest and bills cache writes on their own
+# meter, the Kimi formats do neither. Every type any format reports is
+# parsed, stored, summed and priced; the only thing that varies is whether a
+# viewer is shown a row of zeros.
+TOKEN_TYPE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_output_tokens",
+)
+
+
+def _drop_zero_token_types(entries: list[dict]) -> list[dict]:
+    """Hide token types whose total is zero across the data in view.
+
+    ZERO-SUPPRESSION AT THE PRESENTATION LAYER, NOT OMISSION AT THE DATA
+    LAYER. The column exists, the value is stored, the rate is wired. What
+    this spares a viewer is a row that reads zero for every bucket on
+    screen — e.g. cache writes, which no session in the corpus this was
+    built against has ever used, and reasoning tokens, which no Kimi
+    transcript reports.
+
+    The decision is made per RESPONSE, over the summed totals, not per
+    entry: suppressing per entry would make a series flicker in and out
+    between buckets. The day a session lands with a real value for one of
+    these, it appears on its own — no migration, no backfill, no code
+    change here.
+
+    FRONTEND MIRROR: src/ must treat every TOKEN_TYPE_FIELDS key as
+    optional and render whichever arrive, rather than naming them one by
+    one — the same standing obligation as the rate-table mirror noted in
+    pricing.py. Until that lands the new keys have no reader, which is why
+    they sit in test_payload_fields_are_used.ALLOWED_UNUSED.
+    """
+    totals = {
+        field: sum(int(e.get(field) or 0) for e in entries)
+        for field in TOKEN_TYPE_FIELDS
+    }
+    empty = [f for f, total in totals.items() if total == 0]
+    if not empty:
+        return entries
+    for entry in entries:
+        for field in empty:
+            entry.pop(field, None)
+    return entries
+
+
 def _dash_hourly(hourly_rows: list) -> list:
     hourly = []
     seen_hours: set[str | None] = set()
     for row in hourly_rows:
-        (hour, row_model, input_t, output_t, cr, cost, reqs, sc) = row
+        (hour, row_model, input_t, output_t, cr, reasoning, cw,
+         cost, reqs, sc) = row
         hour_iso = _iso(hour)
-        is_first_for_hour = hour_iso not in seen_hours
+        # session_count rides the FIRST row of each hour only, so summing
+        # the column over a bucket does not multiply it by the models in it.
+        if hour_iso in seen_hours:
+            sc = 0
         seen_hours.add(hour_iso)
         hourly.append({
             "hour": hour_iso,
@@ -452,11 +520,13 @@ def _dash_hourly(hourly_rows: list) -> list:
             "input_tokens": int(input_t or 0),
             "output_tokens": int(output_t or 0),
             "cache_read_tokens": int(cr or 0),
+            "cache_write_tokens": int(cw or 0),
+            "reasoning_output_tokens": int(reasoning or 0),
             "cost_usd": float(cost or 0),
             "requests": int(reqs or 0),
-            "session_count": int(sc or 0) if is_first_for_hour else 0,
+            "session_count": int(sc or 0),
         })
-    return hourly
+    return _drop_zero_token_types(hourly)
 
 
 def _dash_cost_by_project(cost_by_project_rows: list) -> list:

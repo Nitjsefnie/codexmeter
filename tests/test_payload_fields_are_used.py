@@ -45,6 +45,13 @@ ALLOWED_UNUSED: dict[str, str] = {
     "range": "echo of the request parameter",
     "project": "echo of the request parameter",
     "tz": "echo of the server-side timezone used for bucketing",
+    # Token types Codex reports and the Kimi formats do not. They are
+    # parsed, stored, summed and priced; api_dashboard hides them from a
+    # response whose totals are zero, so they only reach the wire once real
+    # data exists. src/ has no reader yet — see the FRONTEND MIRROR note on
+    # api_dashboard._drop_zero_token_types.
+    "reasoning_output_tokens": "Codex-only token type; no frontend reader yet",
+    "cache_write_tokens": "Codex-only token type; no frontend reader yet",
 }
 
 # Generic names that appear all over the frontend for unrelated reasons,

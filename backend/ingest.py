@@ -690,7 +690,8 @@ def rebuild_rollup() -> int:
             INSERT INTO usage_rollup (
               session_id, project_id, hour, model, is_main,
               first_ts, last_ts, requests,
-              fresh_tokens, output_tokens, cache_read_tokens, cost_usd
+              fresh_tokens, output_tokens, cache_read_tokens,
+              reasoning_output_tokens, cache_write_tokens, cost_usd
             )
             SELECT f.session_id,
                    f.project_id,
@@ -701,6 +702,14 @@ def rebuild_rollup() -> int:
                    COALESCE(SUM(r.fresh_tokens), 0),
                    COALESCE(SUM(r.output_tokens), 0),
                    COALESCE(SUM(r.cache_read_tokens), 0),
+                   -- Every token type the records carry gets summed here,
+                   -- including ones that are all-zero for the data present.
+                   -- A type is hidden at RENDER time when its total is zero
+                   -- (see api_dashboard._drop_zero_token_types), never
+                   -- dropped from storage: the day one lands with a real
+                   -- value it appears with no migration and no backfill.
+                   COALESCE(SUM(r.reasoning_output_tokens), 0),
+                   COALESCE(SUM(r.cache_creation_tokens), 0),
                    COALESCE(SUM(r.cost_usd), 0)
               FROM records r
               JOIN files f ON f.file_key = r.file_key
@@ -883,13 +892,13 @@ def _persist(obj, proj, project_id, session_id, is_main, parsed,
                 INSERT INTO records (file_key, line_num, uuid,
                   ts, model, fresh_tokens,
                   cache_creation_tokens, cache_read_tokens,
-                  output_tokens, cost_usd,
+                  output_tokens, reasoning_output_tokens, cost_usd,
                   text_chars, reply_latency_s)
                 VALUES (%(file_key)s, %(line_num)s, %(uuid)s,
                   %(ts)s, %(model)s,
                   %(fresh_tokens)s, %(cache_creation_tokens)s,
                   %(cache_read_tokens)s, %(output_tokens)s,
-                  %(cost_usd)s,
+                  %(reasoning_output_tokens)s, %(cost_usd)s,
                   %(text_chars)s, %(reply_latency_s)s)
                 """,
                 parsed["records"],
