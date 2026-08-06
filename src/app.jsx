@@ -528,7 +528,7 @@ function TopBar({ route, setRoute, isGuest, backendOn }) {
       <div className="topbar-left">
         <div className="logo">
           <span className="logo-mark">{'>'}</span>
-          <span className="logo-text">KIMIMETER</span>
+          <span className="logo-text">CODEXMETER</span>
           <span className="logo-sub">session inspector{isGuest ? ' · guest' : ''}</span>
         </div>
       </div>

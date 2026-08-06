@@ -1,10 +1,10 @@
-# kimimeter
+# codexmeter
 
 A self-hosted web application that visualises Kimi Code session JSONL transcripts.
 
 ## Overview
 
-**kimimeter** ingests transcripts from Cloudflare R2 (or a local `file://` mirror), parses them into Postgres, and serves dashboards and raw transcripts to a React frontend rendered via in-browser Babel (no npm/build step).
+**codexmeter** ingests transcripts from Cloudflare R2 (or a local `file://` mirror), parses them into Postgres, and serves dashboards and raw transcripts to a React frontend rendered via in-browser Babel (no npm/build step).
 
 The dashboard panels include: Session Burn Rate, Cost by Model, Token Breakdown, Prompt-Cache Split, Per-Session Context Growth, Response Sizes, Tool Usage Ratio, Reply Latency, and Tool Error Rate.
 
