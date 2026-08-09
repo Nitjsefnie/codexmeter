@@ -13,9 +13,9 @@ window.generateSyntheticData = function () {
 
   // Pricing per model (USD per token)
   const PRICING = {
-    'gpt-5.6-sol':  { in: 5/1e6, out: 25/1e6, cc: 6.25/1e6, cr: 0.5/1e6 },
-    'gpt-5.6-terra':{ in: 3/1e6, out: 15/1e6, cc: 3.75/1e6, cr: 0.3/1e6 },
-    'gpt-5.6-luna': { in: 1/1e6, out: 5/1e6,  cc: 1.25/1e6, cr: 0.1/1e6 },
+    'gpt-5.6-sol':  { in: 5/1e6,   out: 30/1e6,  cc: 6.25/1e6, cr: 0.5/1e6 },
+    'gpt-5.6-terra':{ in: 2/1e6,   out: 12/1e6,  cc: 2.5/1e6,  cr: 0.2/1e6 },
+    'gpt-5.6-luna': { in: 0.2/1e6, out: 1.2/1e6, cc: 0.25/1e6, cr: 0.02/1e6 },
     '<synthetic>':  { in: 0, out: 0, cc: 0, cr: 0 },
   };
 

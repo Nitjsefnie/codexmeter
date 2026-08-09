@@ -21,9 +21,30 @@ def test_k3_rates_match_source():
     assert r == {"fresh": 3.00, "create": 0.00, "read": 0.30, "output": 15.00}
 
 
+@pytest.mark.parametrize(("model", "want"), [
+    ("gpt-5.6-sol", {"fresh": 5.00, "create": 6.25,
+                     "read": 0.50, "output": 30.00}),
+    ("gpt-5.6-terra", {"fresh": 2.00, "create": 2.50,
+                       "read": 0.20, "output": 12.00}),
+    ("gpt-5.6-luna", {"fresh": 0.20, "create": 0.25,
+                      "read": 0.02, "output": 1.20}),
+])
+def test_codex_rates_match_source(model, want):
+    """A Codex label must reach the same table the browser mirrors."""
+    assert pricing.MODEL_RATES[model] == want
+    assert pricing.rate_for(model) is pricing.MODEL_RATES[model]
+
+
+def test_luna_is_the_flagged_unknown_model_fallback():
+    """The fallback must be a model codexmeter can actually emit, while
+    remaining the cheapest choice for a value explicitly marked estimated.
+    """
+    assert pricing.DEFAULT_RATES is pricing.MODEL_RATES["gpt-5.6-luna"]
+
+
 def test_k3_does_not_fall_through_to_default_rates():
     """kimi-k3 shares no substring with the k2 keys, so a missing table entry
-    would silently bill it at DEFAULT_RATES (k2-6) — ~1/3 of its real cost.
+    would silently bill it at the cheaper generic fallback.
     """
     assert pricing.rate_for("kimi-k3") is not pricing.DEFAULT_RATES
 
@@ -40,8 +61,11 @@ def test_unknown_model_falls_back_to_default():
     assert r == pricing.DEFAULT_RATES
 
 
-# Every label parse._model_for can emit.
-LIVE_MODELS = ("kimi-k3", "kimi-k2-7-code", "kimi-k2-6")
+# Every label either parser can emit.
+LIVE_MODELS = (
+    "kimi-k3", "kimi-k2-7-code", "kimi-k2-6",
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+)
 
 
 @pytest.mark.parametrize("model", LIVE_MODELS)

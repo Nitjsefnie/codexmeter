@@ -68,8 +68,7 @@ def _canonical_model(wire_model: str | None) -> str | None:
 
     Only canonical labels may reach pricing.compute_cost: pricing.rate_for
     matches keys anchored at the start of the id, so a raw "kimi-code/k3"
-    would match no key and silently bill at DEFAULT_RATES (k2-6) — a ~3x
-    undercount.
+    would match no key and silently bill at the cheaper generic fallback.
     """
     if not wire_model:
         return None

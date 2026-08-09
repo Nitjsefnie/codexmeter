@@ -425,7 +425,7 @@ def test_cache_write_tokens_are_billed_on_their_own_meter():
     on the rate table, since no local record exercises the bucket."""
     assert all(r["cache_creation_tokens"] == 0
                for r in _parse("rollout_fork_prefix.jsonl")["records"])
-    rates = pricing.CODEX_MODEL_RATES["gpt-5-6-sol"]
+    rates = pricing.MODEL_RATES["gpt-5.6-sol"]
     assert rates["create"] == pytest.approx(rates["fresh"] * 1.25)
     assert rates["create"] > rates["fresh"] > rates["read"]
     write_only = pricing.compute_cost(
@@ -504,7 +504,7 @@ def test_a_cache_write_is_billed_at_its_own_rate_not_at_fresh_input_rates():
     # Same prompt, but half its uncached part written to cache at 1.25x
     # instead of billed as fresh input at 1x — so it costs strictly MORE.
     assert rec["cost_usd"] > plain["cost_usd"]
-    rates = pricing.CODEX_MODEL_RATES["gpt-5-6-sol"]
+    rates = pricing.MODEL_RATES["gpt-5.6-sol"]
     expected_delta = written * (rates["create"] - rates["fresh"]) / 1_000_000
     assert rec["cost_usd"] - plain["cost_usd"] == pytest.approx(
         expected_delta, abs=1e-6)
@@ -527,31 +527,29 @@ def test_the_billed_buckets_still_partition_the_prompt_exactly_once():
 
 @pytest.mark.parametrize("label", ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
 def test_every_label_the_codex_parser_emits_is_priced_exactly(label):
-    """An unmatched label resolves to DEFAULT_RATES, which are KIMI k2-6
-    rates — a Codex record would be billed at a fifth of its fresh-input
-    price with nothing to say the figure was guessed."""
+    """An unmatched label resolves to the cheapest Codex fallback, which
+    would silently understate Sol or Terra while marking the value estimated.
+    """
     resolution = pricing.resolve(label)
     assert resolution.kind == "exact"
     assert resolution.estimated is False
 
 
-def test_codex_rates_live_outside_the_browser_mirrored_table():
-    """src/parser.js mirrors MODEL_RATES key for key, and its Inspector
-    cannot read a Codex rollout — it parses Kimi wire.jsonl only. Folding
-    the Codex rates into MODEL_RATES breaks that parity for nothing the
-    browser can use, so they sit in their own table until the frontend is
-    ported and the mirror is extended with them.
+def test_every_codex_label_lives_in_the_browser_mirrored_table():
+    """The dashboard calls window.rateForModel for backend Codex rows, so
+    keeping Codex rates outside the mirrored table misprices that view even
+    though the offline parser itself still reads Kimi wires only.
     """
     assert set(pricing.MODEL_RATES) == {
-        "kimi-k3", "kimi-k2-7-code", "kimi-k2-6"
+        "kimi-k3", "kimi-k2-7-code", "kimi-k2-6",
+        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     }
-    assert set(pricing.CODEX_MODEL_RATES).isdisjoint(pricing.MODEL_RATES)
 
 
 def test_codex_records_are_not_billed_at_kimi_rates():
     out = _parse("rollout_model_switch.jsonl")
     for rec in out["records"]:
-        assert pricing.rate_for(rec["model"]) is not pricing.DEFAULT_RATES
+        assert pricing.resolve(rec["model"]).kind == "exact"
 
 
 def test_the_long_context_meter_doubles_input_and_multiplies_output_by_1_5():

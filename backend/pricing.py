@@ -30,7 +30,7 @@ Two resolution behaviours matter, in priority order:
    would take retired kimi-k2-6 pricing, and "kimi-k3-mini" would take K3's
    ~3x rates — silently, with nothing in the payload to say the figure was
    guessed.
-2. DEFAULT — anything else, priced at the cheapest, oldest model and
+2. DEFAULT — anything else, priced at the cheapest Codex model and
    reported as kind="default" so callers can mark the figure estimated
    rather than presenting it as fact.
 
@@ -40,8 +40,8 @@ family name to fall back on, and inventing one generation's rates for an
 unknown id is exactly the silent mispricing rung 1 exists to prevent. The
 kind vocabulary still reserves "tier" so the two repos agree on the field.
 
-Every model parse.py can emit MUST have an entry in one of the two rate
-tables. A missing entry does not raise — resolve() returns DEFAULT_RATES and
+Every model either parser can emit MUST have an entry in MODEL_RATES. A
+missing entry does not raise — resolve() returns DEFAULT_RATES and
 undercounts cost — but it does come back flagged estimated.
 """
 from __future__ import annotations
@@ -59,37 +59,14 @@ MODEL_RATES = {
     "kimi-k3":        {"fresh": 3.00, "create": 0.00, "read": 0.30, "output": 15.00},
     "kimi-k2-7-code": {"fresh": 0.95, "create": 0.00, "read": 0.19, "output": 4.00},
     "kimi-k2-6":      {"fresh": 0.95, "create": 0.00, "read": 0.16, "output": 4.00},
+    # Codex / OpenAI list rates after the 2026-07-30 cut: Terra -20%,
+    # Luna -80%, Sol unchanged. Cache writes are 1.25x fresh input.
+    "gpt-5.6-sol":    {"fresh": 5.00, "create": 6.25, "read": 0.50, "output": 30.00},
+    "gpt-5.6-terra":  {"fresh": 2.00, "create": 2.50, "read": 0.20, "output": 12.00},
+    "gpt-5.6-luna":   {"fresh": 0.20, "create": 0.25, "read": 0.02, "output": 1.20},
 }
 
-# Codex / OpenAI public API list rates as of the 2026-07-30 price cut (Terra
-# -20%, Luna -80%; Sol held at its launch rate). Cache reads keep the 90%
-# discount; explicit cache writes bill at 1.25x uncached input — unlike the
-# Kimi models, where cache creation is free.
-#
-# These are LIST rates by design. The sessions they price ran on a ChatGPT
-# subscription (rate_limits.plan_type is plus/pro), so the figure is what the
-# same work would have cost through the API — the comparable number, not an
-# invoice line.
-#
-# Keys are stored ALREADY NORMALISED (see _normalise): "gpt-5.6-sol" reaches
-# the matcher as "gpt-5-6-sol", so a key spelled with the dot would never
-# match its own model.
-#
-# WHY THIS IS A SEPARATE TABLE, not three more MODEL_RATES entries: MODEL_RATES
-# is mirrored byte for byte by src/parser.js, whose Inspector cannot read a
-# Codex rollout at all — it parses Kimi wire.jsonl only. Folding these in would
-# break that parity contract in exchange for nothing the browser can use.
-# resolve() consults BOTH tables, so every backend reader — including
-# api._per_model, which prices straight off a DB row — prices a Codex model
-# correctly. WHEN THE FRONTEND IS PORTED TO CODEX, mirror this table in
-# src/parser.js and extend test_parser_js_mirror.py to cover it.
-CODEX_MODEL_RATES = {
-    "gpt-5-6-sol":    {"fresh": 5.00, "create": 6.25, "read": 0.50, "output": 30.00},
-    "gpt-5-6-terra":  {"fresh": 2.00, "create": 2.50, "read": 0.20, "output": 12.00},
-    "gpt-5-6-luna":   {"fresh": 0.20, "create": 0.25, "read": 0.02, "output": 1.20},
-}
-
-DEFAULT_RATES = MODEL_RATES["kimi-k2-6"]
+DEFAULT_RATES = MODEL_RATES["gpt-5.6-luna"]
 
 # A Codex request whose prompt exceeds this size bills the WHOLE request at
 # the long-context meter: 2x input, 1.5x output. Applied per record by the
@@ -143,16 +120,16 @@ def _match_key(norm: str) -> tuple[str, dict] | None:
     "@" or a dated snapshot. No key is a prefix of another, but each table
     stays most-specific-first so that a future one can be.
 
-    Both tables are searched, Kimi first. They share no prefix, so the order
-    only fixes which one a future colliding key would win in.
+    Table keys are canonical display labels. Normalise each key for comparison
+    rather than storing an internal spelling that no parser can emit.
     """
-    for table in (MODEL_RATES, CODEX_MODEL_RATES):
-        for key, rates in table.items():
-            if not norm.startswith(key):
-                continue
-            rest = norm[len(key):]
-            if rest == "" or rest[0] in "[@" or _SNAPSHOT_SUFFIX.match(rest):
-                return key, rates
+    for key, rates in MODEL_RATES.items():
+        norm_key = _normalise(key)
+        if not norm.startswith(norm_key):
+            continue
+        rest = norm[len(norm_key):]
+        if rest == "" or rest[0] in "[@" or _SNAPSHOT_SUFFIX.match(rest):
+            return key, rates
     return None
 
 

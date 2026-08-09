@@ -4,15 +4,18 @@
  */
 
 // Must match backend PARSER_VERSION (see backend/.env.example).
-window.PARSER_VERSION = "8";
+window.PARSER_VERSION = "9";
 
 const MODEL_RATES = {
   "kimi-k3":        { fresh: 3.00, create: 0.00, read: 0.30, output: 15.00 },
   "kimi-k2-7-code": { fresh: 0.95, create: 0.00, read: 0.19, output: 4.00 },
   "kimi-k2-6":      { fresh: 0.95, create: 0.00, read: 0.16, output: 4.00 },
+  "gpt-5.6-sol":    { fresh: 5.00, create: 6.25, read: 0.50, output: 30.00 },
+  "gpt-5.6-terra":  { fresh: 2.00, create: 2.50, read: 0.20, output: 12.00 },
+  "gpt-5.6-luna":   { fresh: 0.20, create: 0.25, read: 0.02, output: 1.20 },
 };
 
-const DEFAULT_RATES = MODEL_RATES["kimi-k2-6"];
+const DEFAULT_RATES = MODEL_RATES["gpt-5.6-luna"];
 
 // Hardcoded model transitions, oldest first.  Each constant is a frozen UTC
 // epoch, NOT a live expression.  Boundaries are strictly-before /
@@ -40,7 +43,7 @@ const WIRE_MODEL_MAP = { "k3": "kimi-k3" };
 // Mirrors backend/parse.py _canonical_model. Returns null when the wire cannot
 // settle the model alone. Canonicalising BEFORE any rate lookup is mandatory:
 // rateForModel anchors at the start of the id, so a raw "kimi-code/k3" matches
-// no key and bills at DEFAULT_RATES (k2-6) — a ~3x undercount.
+// no key and bills at the flagged fallback rather than the known K3 rate.
 function canonicalModel(wireModel) {
   if (!wireModel) return null;
   const tail = String(wireModel).split("/").pop();
@@ -94,8 +97,9 @@ const _SNAPSHOT_SUFFIX = /^-?\d{6,8}$/;
 // so that a future one can be.
 function _matchRateKey(norm) {
   for (const key of Object.keys(MODEL_RATES)) {
-    if (!norm.startsWith(key)) continue;
-    const rest = norm.slice(key.length);
+    const normKey = _normaliseModel(key);
+    if (!norm.startsWith(normKey)) continue;
+    const rest = norm.slice(normKey.length);
     if (rest === "" || rest[0] === "[" || rest[0] === "@"
         || _SNAPSHOT_SUFFIX.test(rest)) {
       return key;

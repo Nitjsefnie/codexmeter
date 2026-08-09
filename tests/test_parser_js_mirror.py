@@ -60,6 +60,9 @@ NEAR_MISS_IDS = [
     "kimi-k2-60",
     "x-kimi-k2-7-code-y",
     "kimi-code/k3",       # a raw wire id must NOT be quietly repaired
+    "gpt-5.6-sol-fast",
+    "gpt-5.6-terra-mini",
+    "gpt-5.6-luna-turbo",
     "not-a-real-model",
     "gpt-5",
     "",
@@ -182,13 +185,13 @@ def test_parser_js_prices_every_near_miss_id_at_the_flagged_default(js):
     table edit that made the default equal K3's rates could not hide it.
 
     One blind spot, stated rather than papered over: DEFAULT_RATES IS the
-    kimi-k2-6 entry, and rateForModel returns rates without a kind, so a JS
-    matcher that wrongly accepted "kimi-k2-6-turbo" as an exact kimi-k2-6
+    gpt-5.6-luna entry, and rateForModel returns rates without a kind, so a JS
+    matcher that wrongly accepted "gpt-5.6-luna-turbo" as exact Luna
     would be indistinguishable here from one that defaulted it. That
     divergence is numerically harmless — the same four rates either way —
     and closing it would mean exposing a resolution kind the frontend has
     no reader for. Every near miss whose wrong key carries DIFFERENT rates
-    (the kimi-k3 and kimi-k2-7-code families) is caught outright.
+    (every other family) is caught outright.
     """
     results = {json.dumps(r["model"]): r["rates"] for r in js["results"]}
     for model in NEAR_MISS_IDS:

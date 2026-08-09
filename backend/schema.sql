@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS records (
   line_num                INT  NOT NULL,
   uuid                    TEXT,  -- message_id from StatusUpdate
   ts                      TIMESTAMPTZ,
-  model                   TEXT NOT NULL DEFAULT 'kimi-k2-6',
+  model                   TEXT NOT NULL DEFAULT 'gpt-5.6-sol',
   fresh_tokens            BIGINT NOT NULL DEFAULT 0,   -- input_other
   cache_creation_tokens   BIGINT NOT NULL DEFAULT 0,   -- input_cache_creation
   cache_read_tokens       BIGINT NOT NULL DEFAULT 0,   -- input_cache_read
@@ -59,6 +59,7 @@ ALTER TABLE records ADD COLUMN IF NOT EXISTS
 -- rather than a placeholder awaiting a reparse.
 ALTER TABLE records ADD COLUMN IF NOT EXISTS
   reasoning_output_tokens BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE records ALTER COLUMN model SET DEFAULT 'gpt-5.6-sol';
 
 -- Cross-file uuid dedup, resolved at INGEST instead of on every read.
 -- `records` is immutable between ingests, but every read endpoint was

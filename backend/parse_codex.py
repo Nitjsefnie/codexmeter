@@ -91,8 +91,8 @@ def _codex_model(raw: str | None) -> str:
     """Model string in force -> canonical pricing label.
 
     Only canonical labels may reach pricing.compute_cost: an unmapped id
-    resolves to DEFAULT_RATES, which are KIMI k2-6 rates — off by ~5x on
-    fresh input for a Codex record, silently.
+    resolves to the cheapest Codex fallback — off by 25x on fresh input
+    for the flagship, silently.
     """
     lowered = (raw or "").lower()
     for needle, label in _CODEX_MODEL_MAP:

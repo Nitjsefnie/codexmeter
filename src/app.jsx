@@ -11,7 +11,7 @@ function txToDashData(tx) {
   // Rates come from the shared window.rateForModel table (parser.js) so
   // the Inspector and this path can never disagree on pricing.
   const rateFor = window.rateForModel;
-  const shortM = (model) => window.shortModelName(model || 'kimi');
+  const shortM = (model) => window.shortModelName(model || 'unknown');
 
   // Group all usage records (status_update metas, normalised through
   // window.asUsageRecord) by sessionId, plus user-text events per session
@@ -964,8 +964,7 @@ function SessionsList({ synth, onOpen }) {
           sums.cost += e.cost_usd;
           models[e.model] = (models[e.model] || 0) + 1;
         }
-        let primary = 'kimi-k2-6', max = 0;
-        for (const [m, c] of Object.entries(models)) if (c > max) { max = c; primary = m; }
+        const primary = window.dominantModel(models);
         return {
           id: 'S' + String(i + 1).padStart(4, '0'),
           start: s.start, end: s.end,

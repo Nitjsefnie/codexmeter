@@ -9,16 +9,17 @@ const humanFmt_X = window.humanFmt;
 // ──────────────────────────────────────────────────────────────────────
 
 const CTX_TURN_CAP = Infinity;
-// Kimi context windows — the fork shipped with the Claude caps, which
-// put every kimi model at 200K; K2.6 is a 256K-context model (observed
-// per-call context in the DB already peaks at ~214K, over 200K).
+// Context windows for every canonical label either parser emits.
 const MODEL_CAPS = {
-  'kimi-k2-6':       256_000,
-  'kimi-for-coding': 256_000,
-  'kimi-k2':         256_000,
+  'kimi-k3':          256_000,
+  'kimi-k2-7-code':   256_000,
+  'kimi-k2-6':        256_000,
+  'gpt-5.6-sol':      272_000,
+  'gpt-5.6-terra':    272_000,
+  'gpt-5.6-luna':     272_000,
 };
 function capForModel(m) {
-  return MODEL_CAPS[m] || 256_000;
+  return MODEL_CAPS[m] || 272_000;
 }
 
 function buildSessionTurns(events) {

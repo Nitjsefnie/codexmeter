@@ -40,6 +40,14 @@ const MODEL_COLORS = {
   '<synthetic>':   'oklch(0.65 0.02 260)',  // neutral
 };
 
+function dominantModel(counts) {
+  let primary = 'unknown', max = 0;
+  for (const [model, count] of Object.entries(counts || {})) {
+    if (count > max) { max = count; primary = model; }
+  }
+  return primary;
+}
+
 function humanFmt(v, isCurrency) {
   const prefix = isCurrency ? '$' : '';
   const abs = Math.abs(v);
@@ -825,8 +833,7 @@ function BurnRatePanel({ events, sessions, limitHits, range: propRange, windowBo
       sums.cost += e.cost_usd;
       modelCounts[e.model] = (modelCounts[e.model] || 0) + 1;
     }
-    let primary = 'kimi-k2-6', max = 0;
-    for (const [m, c] of Object.entries(modelCounts)) if (c > max) { max = c; primary = m; }
+    const primary = dominantModel(modelCounts);
     return {
       idx: i,
       start: s.start, end: s.end,
@@ -1138,6 +1145,7 @@ window.BurnRatePanel = BurnRatePanel;
 window.dashboardTheme = TH;
 window.dashboardCol = COL;
 window.modelColors = MODEL_COLORS;
+window.dominantModel = dominantModel;
 window.humanFmt = humanFmt;
 window.humanCurrency = humanCurrency;
 window.fmtDate = fmtDate;
