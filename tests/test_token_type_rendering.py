@@ -21,7 +21,11 @@ from pathlib import Path
 import pytest
 
 from backend import api_dashboard
-from backend.api_dashboard import TOKEN_TYPE_FIELDS, _drop_zero_token_types
+from backend.api_dashboard import (
+    TOKEN_TYPE_FIELDS,
+    _drop_zero_token_types,
+    _token_type_metadata,
+)
 
 # Reuses the API suite's fresh-DB + mini-R2 fixture (Kimi transcripts).
 pytest_plugins = ["test_api"]
@@ -131,9 +135,7 @@ def test_metadata_distinguishes_total_addends_from_output_subsets():
         input_tokens=100, output_tokens=50, cache_write_tokens=3,
         reasoning_output_tokens=7,
     )])
-    metadata_fn = getattr(api_dashboard, "_token_type_metadata", None)
-    assert callable(metadata_fn), "dashboard token metadata helper is missing"
-    metadata = metadata_fn(hourly)
+    metadata = _token_type_metadata(hourly)
     by_field = {item["field"]: item for item in metadata}
 
     assert set(by_field) == {
@@ -154,9 +156,7 @@ def test_metadata_omits_every_zero_suppressed_type():
     hourly = _drop_zero_token_types([
         _entry(input_tokens=100, output_tokens=50),
     ])
-    metadata_fn = getattr(api_dashboard, "_token_type_metadata", None)
-    assert callable(metadata_fn), "dashboard token metadata helper is missing"
-    assert [item["field"] for item in metadata_fn(hourly)] == [
+    assert [item["field"] for item in _token_type_metadata(hourly)] == [
         "input_tokens", "output_tokens",
     ]
 

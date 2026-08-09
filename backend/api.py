@@ -102,6 +102,7 @@ def _known_model(model: str | None) -> bool:
     """
     return bool(model) and pricing.resolve(model).kind == "exact"
 
+
 UNRESOLVED_PROJECT_ID = "<unresolved>"
 
 # Activity-heatmap timezone. Bound as a SQL parameter (never interpolated);

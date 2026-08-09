@@ -10,6 +10,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -32,7 +33,7 @@ def _node(script: str) -> object:
 
 
 def test_synthetic_codex_events_use_backend_rates():
-    rows = _node("""
+    rows = cast(dict[str, dict[str, float]], _node("""
       global.window = {};
       eval(require('fs').readFileSync('src/synthetic-data.js', 'utf8'));
       const first = {};
@@ -42,7 +43,7 @@ def test_synthetic_codex_events_use_backend_rates():
         }
       }
       console.log(JSON.stringify(first));
-    """)
+    """))
     assert set(rows) == {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
     for model, row in rows.items():
         rates = pricing.MODEL_RATES[model]
