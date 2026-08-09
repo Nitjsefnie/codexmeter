@@ -29,7 +29,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from backend import api, api_dashboard, cache, db, events, parse, r2
 
-log = logging.getLogger("kimimeter.ingest")
+log = logging.getLogger("codexmeter.ingest")
 
 # What the fetch retry treats as transient. None of the boto3 failures is an
 # OSError — ConnectionClosedError and EndpointConnectionError are
@@ -594,11 +594,11 @@ def warm_common() -> None:
     opens still costs one cold query, but the landing view never does.
 
     Runs on the cache's background pool, so ingest returns immediately.
-    Disabled by KIMIMETER_WARM_CACHE=0 — the tests set that, because a
+    Disabled by CODEXMETER_WARM_CACHE=0 — the tests set that, because a
     warm outlives the fixture that created its database and its queries
     then race the teardown that drops it.
     """
-    if os.environ.get("KIMIMETER_WARM_CACHE", "1").lower() in ("0", "false", "no"):
+    if os.environ.get("CODEXMETER_WARM_CACHE", "1").lower() in ("0", "false", "no"):
         return
 
     # Every range the picker offers, so no button lands on a cold query.

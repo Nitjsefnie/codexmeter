@@ -298,7 +298,7 @@ def test_warm_common_covers_every_warmed_range(fresh_db, mini_r2_env, monkeypatc
     to the endpoint's signature default ("30d") while the UI opens on
     "all", so the one request every page load makes was never warmed.
     """
-    monkeypatch.setenv("KIMIMETER_WARM_CACHE", "1")
+    monkeypatch.setenv("CODEXMETER_WARM_CACHE", "1")
     ingest.run_ingest(trigger="manual")
 
     warmed = (

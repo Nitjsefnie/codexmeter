@@ -741,6 +741,37 @@ def test_tool_endpoints_rollup_matches_live_path(app_with_fresh_data, monkeypatc
     assert rolled_errors["buckets"] == live_errors["buckets"]
 
 
+def test_tool_endpoints_accept_codex_models_without_inventing_attribution(
+        app_with_fresh_data):
+    """The rollup has no model dimension. A known filter gates the shared
+    data and labels filtered error rows with the request; an unfiltered row
+    must say unknown rather than claiming every call belonged to one model.
+    """
+    _insert_tool_probe_rows()
+
+    usage = app_with_fresh_data.get(
+        "/api/tool-usage?range=3650d&model=gpt-5.6-sol"
+    ).json()
+    assert usage["buckets"], "a canonical Codex model must pass the gate"
+
+    filtered_errors = app_with_fresh_data.get(
+        "/api/tool-error-rate?range=3650d&model=gpt-5.6-terra"
+    ).json()["buckets"]
+    assert filtered_errors
+    assert {row["model"] for row in filtered_errors} == {"gpt-5.6-terra"}
+
+    unfiltered_errors = app_with_fresh_data.get(
+        "/api/tool-error-rate?range=3650d"
+    ).json()["buckets"]
+    assert unfiltered_errors
+    assert {row["model"] for row in unfiltered_errors} == {"unknown"}
+
+    unknown = app_with_fresh_data.get(
+        "/api/tool-usage?range=3650d&model=not-a-real-model"
+    ).json()
+    assert unknown["buckets"] == []
+
+
 def _insert_churn_probe_rows():
     """Seed tool_uses rows with KNOWN edit churn at three recent hours.
 

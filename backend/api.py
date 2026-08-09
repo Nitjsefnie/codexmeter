@@ -27,29 +27,29 @@ from backend.cache import cache_response
 
 router = APIRouter(prefix="/api")
 
-log = logging.getLogger("kimimeter.api")
+log = logging.getLogger("codexmeter.api")
 
 # Per-phase wall-clock for the heavy read endpoints, emitted as one log
-# line per request. Gated on KIMIMETER_TIMING so it costs nothing normally,
+# line per request. Gated on CODEXMETER_TIMING so it costs nothing normally,
 # but stays in the tree — reconstructing these queries by hand in psql
 # drifts from what the endpoint actually runs and hides everything that
 # happens outside SQL (row marshalling, response serialisation).
-TIMING_ON = os.environ.get("KIMIMETER_TIMING", "").lower() not in ("", "0", "false", "no")
+TIMING_ON = os.environ.get("CODEXMETER_TIMING", "").lower() not in ("", "0", "false", "no")
 
-_KIMIMETER_LOGGER = logging.getLogger("kimimeter")
+_CODEXMETER_LOGGER = logging.getLogger("codexmeter")
 
-if TIMING_ON and not _KIMIMETER_LOGGER.handlers:
+if TIMING_ON and not _CODEXMETER_LOGGER.handlers:
     # uvicorn configures its own loggers and leaves the root logger at
     # WARNING, so a bare log.info() here would go nowhere. Attach our own
     # handler rather than depending on someone else's logging config.
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter("%(levelname)s:     %(message)s"))
-    # Attached to the "kimimeter" PARENT, not "kimimeter.api": ingest logs
-    # under "kimimeter.ingest" and was silently discarded, so
+    # Attached to the "codexmeter" PARENT, not "codexmeter.api": ingest logs
+    # under "codexmeter.ingest" and was silently discarded, so
     # recompute_canonical / rebuild_* / warm_common reported nothing.
-    _KIMIMETER_LOGGER.addHandler(_handler)
-    _KIMIMETER_LOGGER.setLevel(logging.INFO)
-    _KIMIMETER_LOGGER.propagate = False
+    _CODEXMETER_LOGGER.addHandler(_handler)
+    _CODEXMETER_LOGGER.setLevel(logging.INFO)
+    _CODEXMETER_LOGGER.propagate = False
 
 
 class Phases:
@@ -94,11 +94,13 @@ class Phases:
         log.info("TIMING %s total=%.0fms %s %s", self._name, total, parts, tail)
 
 
-# Kimi-only ingest right now — parse.py emits one of these for every record.
-# When codexmeter starts ingesting other ecosystems (Claude jsonls, etc.)
-# the JOIN-by-line_num assumption breaks for those sources too; at that
-# point promote model to a `tool_uses.model` column populated at parse time.
-_ONLY_MODELS = ("kimi-k2-6", "kimi-k2-7-code", "kimi-k3")
+def _known_model(model: str | None) -> bool:
+    """Whether a filter names a model the shared pricing catalog knows.
+
+    Tool rollups intentionally have no model dimension, so this validates
+    the filter without pretending the surviving calls were attributed by it.
+    """
+    return bool(model) and pricing.resolve(model).kind == "exact"
 
 UNRESOLVED_PROJECT_ID = "<unresolved>"
 
@@ -219,14 +221,13 @@ def tool_usage(
     delta = _parse_range(range_)
     since = datetime.now(timezone.utc) - delta
     bucket_s = _bucket_seconds(delta)
-    # Model filter: in Kimi, every record carries model='kimi-k2-6' or
-    # 'kimi-k2-7-code' (assigned by first-event timestamp in parse.py).
+    # Every record carries a model, but tool_uses deliberately does not.
     # Joining `records` to filter by model is BROKEN here because
     # tool_uses.line_num != records.line_num in Kimi wire.jsonl (tool_uses
     # live on ToolCall lines, records on StatusUpdate lines — disjoint sets).
-    # Apply the model filter in Python: if the requested substring matches a
-    # model we ingest, pass; else short-circuit to an empty result.
-    if model and not any(m in model for m in _ONLY_MODELS):
+    # Apply a catalog gate in Python: known model means the shared tool data
+    # remains available; unknown model means an empty result.
+    if model and not _known_model(model):
         return {"range": range_, "project": project, "bucket_s": bucket_s, "buckets": []}
     args: list[Any] = [since]
     proj_filter = _proj_tool(project, args)
@@ -276,12 +277,12 @@ def tool_error_rate(
     delta = _parse_range(range_)
     since = datetime.now(timezone.utc) - delta
     bucket_s = _bucket_seconds(delta)
-    # See tool_usage above for why the records JOIN is wrong for Kimi data
+    # See tool_usage above for why the records JOIN is wrong for tool data
     # (tool_uses.line_num lives on ToolCall lines, records.line_num on
     # StatusUpdate lines — they're disjoint, so the JOIN produces zero rows
-    # and the frontend sees an empty result). Hardcode the models the parser
-    # emits and apply the filter in Python.
-    if model and not any(m in model for m in _ONLY_MODELS):
+    # and the frontend sees an empty result). Validate through the shared
+    # pricing catalog instead of restating parser labels here.
+    if model and not _known_model(model):
         return {"range": range_, "project": project, "bucket_s": bucket_s, "buckets": []}
     args: list[Any] = [since]
     proj_filter = _proj_tool(project, args)
@@ -302,7 +303,7 @@ def tool_error_rate(
             HAVING SUM(t.n_rated) > 0
             ORDER BY 1, 3
             """),
-            [model if model else _ONLY_MODELS[0], *args],
+            [model or "unknown", *args],
         ).fetchall()
 
     return {
@@ -675,7 +676,7 @@ def list_projects(range_: str = Query("30d", alias="range")) -> dict:
     "30d").
 
     Projects whose ALL-TIME cost is 0 are dropped entirely (never-cost
-    projects are noise — 334 of 496 kimimeter projects, expected). A
+    projects are noise — 334 of 496 codexmeter projects, expected). A
     project with all-time cost but nothing in the selected range is still
     returned — sorted to the bottom with a cost of 0 — since this is a
     re-sort of the existing list, not a range filter; the ALL-TIME-zero

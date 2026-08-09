@@ -13,7 +13,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
-log = logging.getLogger("kimimeter.cache")
+log = logging.getLogger("codexmeter.cache")
 
 
 class _IdleLRU:

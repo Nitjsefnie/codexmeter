@@ -1,7 +1,7 @@
 """Postgres connection pools.
 
 Two pools:
-- viz_pool   → kimimeter (this app's tables)
+- viz_pool   → codexmeter (this app's tables)
 - auth_pool  → external users DB (read-only access to users.config for auth)
 
 The pools never join across DBs.
@@ -88,7 +88,7 @@ def auth_conn():
 def schema_check() -> None:
     """Fail fast at startup if either DB's required shape is missing.
 
-    For kimimeter: 'files' table exists.
+    For codexmeter: 'files' table exists.
     For the auth DB: 'users' table has a JSONB 'config' column.
     Raises RuntimeError on any mismatch.
     """
@@ -98,7 +98,7 @@ def schema_check() -> None:
         ).fetchone()
         if row is None or row[0] is None:
             raise RuntimeError(
-                "kimimeter.files missing — run backend/schema.sql"
+                "codexmeter.files missing — run backend/schema.sql"
             )
     with auth_conn() as c:
         row = c.execute(

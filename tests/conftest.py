@@ -40,7 +40,7 @@ os.environ.setdefault("COOKIE_SECURE", "0")
 # No background cache warming under test: a warm queued by run_ingest
 # outlives the fixture that created its DB, and its queries then race the
 # teardown that drops it — producing failures in unrelated tests.
-os.environ["KIMIMETER_WARM_CACHE"] = "0"
+os.environ["CODEXMETER_WARM_CACHE"] = "0"
 
 
 @pytest.fixture(autouse=True)
