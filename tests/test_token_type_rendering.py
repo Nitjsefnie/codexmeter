@@ -126,6 +126,41 @@ def test_a_type_is_kept_on_a_single_nonzero_bucket_among_many_zeros():
     assert sum(e["cache_write_tokens"] for e in out) == 1
 
 
+def test_metadata_distinguishes_total_addends_from_output_subsets():
+    hourly = _drop_zero_token_types([_entry(
+        input_tokens=100, output_tokens=50, cache_write_tokens=3,
+        reasoning_output_tokens=7,
+    )])
+    metadata_fn = getattr(api_dashboard, "_token_type_metadata", None)
+    assert callable(metadata_fn), "dashboard token metadata helper is missing"
+    metadata = metadata_fn(hourly)
+    by_field = {item["field"]: item for item in metadata}
+
+    assert set(by_field) == {
+        "input_tokens", "output_tokens", "cache_write_tokens",
+        "reasoning_output_tokens",
+    }
+    assert by_field["cache_write_tokens"] == {
+        "field": "cache_write_tokens", "label": "Cache Write",
+        "total": True, "rate": "create",
+    }
+    assert by_field["reasoning_output_tokens"] == {
+        "field": "reasoning_output_tokens", "label": "Reasoning Output",
+        "total": False, "rate": None,
+    }
+
+
+def test_metadata_omits_every_zero_suppressed_type():
+    hourly = _drop_zero_token_types([
+        _entry(input_tokens=100, output_tokens=50),
+    ])
+    metadata_fn = getattr(api_dashboard, "_token_type_metadata", None)
+    assert callable(metadata_fn), "dashboard token metadata helper is missing"
+    assert [item["field"] for item in metadata_fn(hourly)] == [
+        "input_tokens", "output_tokens",
+    ]
+
+
 # --------------------------------------------------------------------------
 # End to end, against the real dashboard payload
 # --------------------------------------------------------------------------
@@ -155,6 +190,9 @@ def test_the_dashboard_still_sends_the_types_that_do_have_data(
     for entry in body["hourly"]:
         assert "input_tokens" in entry
         assert "output_tokens" in entry
+    assert [item["field"] for item in body["token_types"]] == [
+        field for field in TOKEN_TYPE_FIELDS if totals[field] > 0
+    ]
 
 
 def test_every_token_type_field_is_one_the_rollup_can_actually_supply():

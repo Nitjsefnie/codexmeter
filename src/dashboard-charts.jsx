@@ -24,6 +24,8 @@ const COL = {
   inputTokens:       cssVar('--accent', '#00d4aa'),
   outputTokens:      '#ff9c5a',
   cacheReadTokens:   'oklch(0.72 0.14 25)',
+  cacheWriteTokens:  '#4bc6e8',
+  reasoningOutputTokens: '#b98be8',
   totalTokens:       'oklch(0.78 0.14 245)',
   costUSD:           cssVar('--gold', 'oklch(0.85 0.14 90)'),
   linesAdded:        '#44dd66',
@@ -215,6 +217,16 @@ function Tooltip({ tip }) {
   );
 }
 
+function finiteSeriesValue(event, valueKey) {
+  if (!Object.prototype.hasOwnProperty.call(event, valueKey)
+      || event[valueKey] == null) return 0;
+  const value = event[valueKey];
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new TypeError(`Invalid series value ${valueKey}`);
+  }
+  return value;
+}
+
 // --- Time-series panel ---
 function TimeSeriesPanel({ title, events, valueKey, color, isCurrency, range, binMs }) {
   const ref = React.useRef(null);
@@ -278,7 +290,7 @@ function TimeSeriesPanel({ title, events, valueKey, color, isCurrency, range, bi
     let sum = 0;
     let count = 0;
     while (i < events.length && events[i].ts < bEnd) {
-      sum += events[i][valueKey] || 0;
+      sum += finiteSeriesValue(events[i], valueKey);
       count++;
       i++;
     }

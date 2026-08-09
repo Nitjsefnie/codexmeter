@@ -455,13 +455,19 @@ def _dash_cost_by_model(hourly: list) -> list:
 # meter, the Kimi formats do neither. Every type any format reports is
 # parsed, stored, summed and priced; the only thing that varies is whether a
 # viewer is shown a row of zeros.
-TOKEN_TYPE_FIELDS = (
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-    "reasoning_output_tokens",
+TOKEN_TYPES = (
+    {"field": "input_tokens", "label": "Input Tokens",
+     "total": True, "rate": "fresh"},
+    {"field": "output_tokens", "label": "Output Tokens",
+     "total": True, "rate": "output"},
+    {"field": "cache_read_tokens", "label": "Cache Read",
+     "total": True, "rate": "read"},
+    {"field": "cache_write_tokens", "label": "Cache Write",
+     "total": True, "rate": "create"},
+    {"field": "reasoning_output_tokens", "label": "Reasoning Output",
+     "total": False, "rate": None},
 )
+TOKEN_TYPE_FIELDS = tuple(item["field"] for item in TOKEN_TYPES)
 
 
 def _drop_zero_token_types(entries: list[dict]) -> list[dict]:
@@ -497,6 +503,12 @@ def _drop_zero_token_types(entries: list[dict]) -> list[dict]:
         for field in empty:
             entry.pop(field, None)
     return entries
+
+
+def _token_type_metadata(entries: list[dict]) -> list[dict]:
+    """Describe exactly the token fields that survived zero suppression."""
+    present = {key for entry in entries for key in entry}
+    return [dict(item) for item in TOKEN_TYPES if item["field"] in present]
 
 
 def _dash_hourly(hourly_rows: list) -> list:
@@ -629,6 +641,7 @@ def _dash_payload(q: _DashQuery, rows: _DashRows) -> dict:
         "project": q.project,
         "bucket_s": q.bucket_s,
         "hourly": hourly,
+        "token_types": _token_type_metadata(hourly),
         "cost_by_model": _dash_cost_by_model(hourly),
         "cost_by_project": _dash_cost_by_project(rows.cost_by_project),
         "rate_limit_hits": _dash_rate_limits(rows.rate_limits),

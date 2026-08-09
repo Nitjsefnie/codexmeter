@@ -90,6 +90,7 @@ function txToDashData(tx) {
         model: shortM(u.model),
         input_tokens: u.input,
         output_tokens: u.output,
+        cache_read_tokens: u.read,
         cache_read: u.read,
         cost_usd: cost,
         ctx: u.ctx,
@@ -438,22 +439,93 @@ function ProjectPicker({ projects, active, onChange }) {
 // are mapped to one synthetic "event" per hour bucket so the dashboard
 // panels render correctly. Per-turn detail is loaded separately via the
 // Inspector when a user opens a session.
+function optionalFiniteNumber(object, field) {
+  if (!Object.prototype.hasOwnProperty.call(object, field)) return 0;
+  const value = object[field];
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new TypeError(`Invalid numeric field ${field}`);
+  }
+  return value;
+}
+
+const FALLBACK_TOKEN_TYPES = [
+  { field: 'input_tokens', label: 'Input Tokens', total: true, rate: 'fresh' },
+  { field: 'output_tokens', label: 'Output Tokens', total: true, rate: 'output' },
+  { field: 'cache_read_tokens', label: 'Cache Read', total: true, rate: 'read' },
+];
+
+const TOKEN_COLOR_KEYS = {
+  input_tokens: 'inputTokens',
+  output_tokens: 'outputTokens',
+  cache_read_tokens: 'cacheReadTokens',
+  cache_write_tokens: 'cacheWriteTokens',
+  reasoning_output_tokens: 'reasoningOutputTokens',
+};
+
+function tokenTypeColor(field) {
+  const named = window.dashboardCol[TOKEN_COLOR_KEYS[field]];
+  if (named) return named;
+  let hash = 0;
+  for (let i = 0; i < field.length; i++) hash = (hash * 31 + field.charCodeAt(i)) | 0;
+  return `hsl(${((hash % 360) + 360) % 360}, 58%, 62%)`;
+}
+
+function normalizedTokenTypes(payload) {
+  const supplied = Array.isArray(payload.token_types) && payload.token_types.length
+    ? payload.token_types
+    : FALLBACK_TOKEN_TYPES.filter(type =>
+        (payload.hourly || []).some(row => Object.prototype.hasOwnProperty.call(row, type.field)));
+  return supplied.map(type => {
+    if (!type || typeof type.field !== 'string' || typeof type.label !== 'string') {
+      throw new TypeError('Invalid token type metadata');
+    }
+    return {
+      field: type.field,
+      label: type.label,
+      total: type.total === true,
+      rate: type.rate == null ? null : String(type.rate),
+    };
+  });
+}
+
+function tokenTotal(events, tokenTypes) {
+  const addends = (tokenTypes || []).filter(type => type.total);
+  return (events || []).reduce(
+    (sum, event) => sum + addends.reduce(
+      (eventSum, type) => eventSum + optionalFiniteNumber(event, type.field), 0),
+    0);
+}
+
+function tokenPanelDefinitions(tokenTypes) {
+  return (tokenTypes || []).map(type => ({
+    ...type,
+    color: tokenTypeColor(type.field),
+  }));
+}
+
 function backendDashToShape(b) {
   // Canonicalize raw backend model strings once, so every downstream
   // consumer (model colors, Cost by Model labels, burn-rate dots) agrees.
   const short = m => window.shortModelName(m || 'unknown');
-  const events = (b.hourly || []).map((h, i) => ({
-    ts: Date.parse(h.hour),
-    session_id: 'backend-h' + i,
-    turn_index: 0,
-    model: short(h.model),
-    input_tokens: h.input_tokens,
-    output_tokens: h.output_tokens,
-    cache_read: h.cache_read_tokens,
-    cost_usd: h.cost_usd,
-    requests: h.requests || 1,
-    session_count: h.session_count || 0,
-  })).filter(e => !isNaN(e.ts));
+  const tokenTypes = normalizedTokenTypes(b);
+  const events = (b.hourly || []).map((h, i) => {
+    const event = {
+      ts: Date.parse(h.hour),
+      session_id: 'backend-h' + i,
+      turn_index: 0,
+      model: short(h.model),
+      cost_usd: h.cost_usd,
+      requests: h.requests || 1,
+      session_count: h.session_count || 0,
+    };
+    for (const type of tokenTypes) {
+      event[type.field] = optionalFiniteNumber(h, type.field);
+    }
+    // Compatibility alias for the non-token panels that predate the generic
+    // token contract. Token arithmetic uses the canonical payload field.
+    event.cache_read = optionalFiniteNumber(event, 'cache_read_tokens');
+    return event;
+  }).filter(e => !isNaN(e.ts));
   if (!events.length) return null;
   // Edit churn (issue #17): two positive series — lines added, lines
   // deleted — bucketed server-side at bucket_s. The panels plot them with
@@ -507,7 +579,7 @@ function backendDashToShape(b) {
   // $15K mismatch with the summary stat).
   const end = events[events.length - 1].ts + 1;
   return {
-    events, limitHits, range: { start, end }, costByModel,
+    events, tokenTypes, limitHits, range: { start, end }, costByModel,
     costByProject: b.cost_by_project || [],
     churnEvents,
     sessionsOverride: sessions,
@@ -578,43 +650,47 @@ function computeSessions(events) {
   return { sessions, windowBoundaries };
 }
 
-// Compute Token Breakdown rows (tokens + cost per type) from a set of
-// hourly events. Shared by TokenBreakdownPanel; the per-panel model filter
-// passes a pre-filtered subset of events. Kimi never emits cache_create, so
-// the breakdown is Input / Output / Cache Read only.
-function computeTokenBreakdown(events) {
-  const t = { input: 0, output: 0, cr: 0 };
-  for (const e of events) {
-    t.input += e.input_tokens; t.output += e.output_tokens;
-    t.cr += e.cache_read;
-  }
-  const tokenTotal = t.input + t.output + t.cr;
-
-  const c = { input: 0, output: 0, cr: 0 };
-  if (window.rateForModel) {
-    for (const e of events) {
-      const r = window.rateForModel(e.model);
-      c.input  += (e.input_tokens  || 0) * r.fresh;
-      c.output += (e.output_tokens || 0) * r.out;
-      c.cr     += (e.cache_read    || 0) * r.read;
+// Compute token and cost breakdown rows from the same metadata that drives
+// the time-series panels. Subsets such as reasoning output get a token row
+// but no second cost attribution: their cost already lives in Output.
+function computeTokenBreakdown(events, tokenTypes) {
+  const rows = tokenPanelDefinitions(tokenTypes).map(type => {
+    let value = 0;
+    let cost = type.rate == null ? null : 0;
+    for (const event of events) {
+      const tokens = optionalFiniteNumber(event, type.field);
+      value += tokens;
+      if (cost != null && window.rateForModel) {
+        const rates = window.rateForModel(event.model);
+        const rate = rates[type.rate];
+        if (typeof rate !== 'number' || !Number.isFinite(rate)) {
+          throw new TypeError(`Invalid rate ${type.rate} for ${event.model}`);
+        }
+        cost += tokens * rate / 1_000_000;
+      }
     }
-    for (const k of Object.keys(c)) c[k] = c[k] / 1_000_000;
-  }
-  const costTotal = c.input + c.output + c.cr;
+    return {
+      field: type.field,
+      label: type.total ? type.label : `${type.label} (subset)`,
+      value,
+      cost,
+      color: type.color,
+    };
+  }).filter(row => row.value > 0);
 
-  const rows = [
-    { label: 'Input',      value: t.input,  cost: c.input,  color: window.dashboardCol.inputTokens },
-    { label: 'Output',     value: t.output, cost: c.output, color: window.dashboardCol.outputTokens },
-    { label: 'Cache Read', value: t.cr,     cost: c.cr,     color: window.dashboardCol.cacheReadTokens },
-  ].filter(r => r.value > 0).sort((a, b) => b.cost - a.cost);
-
-  return { rows, tokenTotal: tokenTotal || 1, costTotal: costTotal || 1 };
+  const costTotal = rows.reduce(
+    (sum, row) => sum + (row.cost == null ? 0 : row.cost), 0);
+  return {
+    rows,
+    tokenTotal: tokenTotal(events, tokenTypes) || 1,
+    costTotal: costTotal || 1,
+  };
 }
 
 // Paired token/cost breakdown bars with a per-panel model filter, mirroring
 // the model select on Tool Usage Ratio over Time. The filter is client-side
 // (events are already loaded) and applies to both bars at once.
-function TokenBreakdownPanel({ events }) {
+function TokenBreakdownPanel({ events, tokenTypes }) {
   const [activeModel, setActiveModel] = useState('');
 
   // Model options derived from the events actually present (already short
@@ -632,7 +708,7 @@ function TokenBreakdownPanel({ events }) {
     () => (activeModel ? events.filter(e => e.model === activeModel) : events),
     [events, activeModel]);
   const { rows, tokenTotal, costTotal } = useMemo(
-    () => computeTokenBreakdown(filtered), [filtered]);
+    () => computeTokenBreakdown(filtered, tokenTypes), [filtered, tokenTypes]);
 
   // One bordered card (matching the sibling "Cost by Model" card) so the
   // shared model filter visibly belongs to the whole Token Breakdown panel
@@ -670,7 +746,8 @@ function TokenBreakdownPanel({ events }) {
       <window.HBar
         embedded
         title="Token Breakdown — by cost"
-        rows={[...rows].map(r => ({ ...r, value: r.cost })).sort((a, b) => b.value - a.value)}
+        rows={rows.filter(r => r.cost != null && r.cost > 0)
+          .map(r => ({ ...r, value: r.cost })).sort((a, b) => b.value - a.value)}
         fmt={r => `${window.humanCurrency(r.value)} (${(r.value / costTotal * 100).toFixed(1)}%)`} />
     </div>
   );
@@ -714,7 +791,10 @@ function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashN
     costByProject: backendByProject = [],
     sessionsOverride, totalSessions, mainWUsage, mainEmpty, subagentFiles,
     subagentOnlySessions, responseSizes, ctxTraces, bucketS, churnEvents,
+    tokenTypes: suppliedTokenTypes,
   } = synth || {};
+  const tokenTypes = (suppliedTokenTypes && suppliedTokenTypes.length)
+    ? suppliedTokenTypes : FALLBACK_TOKEN_TYPES;
   // Placeholder window so the bin-size maths below stays finite pre-data.
   const range = dataRange || { start: Date.now() - 86400000, end: Date.now() };
   const hasBackendByModel = backendByModel && Object.keys(backendByModel).length > 0;
@@ -725,17 +805,15 @@ function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashN
   const windowBoundaries = computed.windowBoundaries;
 
   const totals = useMemo(() => {
-    const t = { input: 0, output: 0, cr: 0, cost: 0 };
+    const t = { cost: 0 };
     const byModel = {};
     for (const e of events) {
-      t.input += e.input_tokens; t.output += e.output_tokens;
-      t.cr += e.cache_read;
       t.cost += e.cost_usd;
       byModel[e.model] = (byModel[e.model] || 0) + e.cost_usd;
     }
-    t.total = t.input + t.output + t.cr;
+    t.total = tokenTotal(events, tokenTypes);
     return { ...t, byModel: hasBackendByModel ? backendByModel : byModel };
-  }, [events, backendByModel, hasBackendByModel]);
+  }, [events, tokenTypes, backendByModel, hasBackendByModel]);
 
   // Churn is its own per-bucket series with no model dimension (one row
   // per bucket), so the range total is a plain sum — no double-counting
@@ -750,6 +828,7 @@ function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashN
   }, [churnEvents]);
 
   const binMs = dashboardBinMs(range, bucketS);
+  const tokenPanels = tokenPanelDefinitions(tokenTypes);
 
   const costByModel = Object.entries(totals.byModel)
     .filter(([, v]) => v > 0)
@@ -808,13 +887,13 @@ function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashN
 
       {hasData && (<>
       <div className="dash-grid">
-        <window.TimeSeriesPanel title="Input Tokens"  events={events} valueKey="input_tokens"
-          color={window.dashboardCol.inputTokens} range={range} binMs={binMs} />
-        <window.TimeSeriesPanel title="Output Tokens" events={events} valueKey="output_tokens"
-          color={window.dashboardCol.outputTokens} range={range} binMs={binMs} />
-        <window.TimeSeriesPanel title="Cache Read"    events={events} valueKey="cache_read"
-          color={window.dashboardCol.cacheReadTokens} range={range} binMs={binMs} />
-        <window.TimeSeriesPanel title="Total Tokens"  events={events.map(e => ({...e, _t: e.input_tokens+e.output_tokens+e.cache_read}))}
+        {tokenPanels.map(panel => (
+        <window.TimeSeriesPanel key={panel.field} title={panel.label}
+          events={events} valueKey={panel.field} color={panel.color}
+          range={range} binMs={binMs} />
+        ))}
+        <window.TimeSeriesPanel title="Total Tokens"
+          events={events.map(e => ({...e, _t: tokenTotal([e], tokenTypes)}))}
           valueKey="_t" color={window.dashboardCol.totalTokens} range={range} binMs={binMs} />
         <window.TimeSeriesPanel title="Cost (USD)"    events={events} valueKey="cost_usd"
           color={window.dashboardCol.costUSD} range={range} binMs={binMs} isCurrency />
@@ -837,7 +916,7 @@ function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashN
           rows={costByModel}
           fixedColors={window.modelColors}
           fmt={r => window.humanCurrency(r.value)} />
-        <TokenBreakdownPanel events={events} />
+        <TokenBreakdownPanel events={events} tokenTypes={tokenTypes} />
       </div>
 
       {/* Only meaningful with the project filter on "All" — a single

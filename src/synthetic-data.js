@@ -87,6 +87,7 @@ window.generateSyntheticData = function () {
         model,
         input_tokens: inputT,
         output_tokens: outputT,
+        cache_read_tokens: crT,
         cache_read: crT,
         cost_usd: cost,
         is_api_error: 0,
