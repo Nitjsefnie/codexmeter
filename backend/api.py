@@ -215,9 +215,9 @@ def tool_usage(
     and promotes any tool that ever cracked top-N at any bucket.
     Tools that never make the cut land in 'Other'.
 
-    `model=opus-4-7` filters to tool calls emitted by an assistant
-    message whose record matches the model substring (joined on
-    file_key + line_num)."""
+    Tool rollups have no model dimension. A known exact catalog model keeps
+    the shared tool data available; an unknown model returns no buckets.
+    The response must not be interpreted as model-attributed tool usage."""
     delta = _parse_range(range_)
     since = datetime.now(timezone.utc) - delta
     bucket_s = _bucket_seconds(delta)
@@ -271,9 +271,10 @@ def tool_error_rate(
     error-rate = n_error / n_total per series and EMA-smooths the
     sequence.
 
-    `model` is an optional model substring filter (parity with
-    /api/tool-usage). Cross-file uuid dedup does NOT apply — tool_uses
-    aren't keyed on records.uuid; the natural boundary is per-file."""
+    Tool rollups have no model dimension. A known exact catalog model keeps
+    the shared tool data available; an unknown model returns no buckets.
+    Cross-file uuid dedup does NOT apply — tool_uses aren't keyed on
+    records.uuid; the natural boundary is per-file."""
     delta = _parse_range(range_)
     since = datetime.now(timezone.utc) - delta
     bucket_s = _bucket_seconds(delta)

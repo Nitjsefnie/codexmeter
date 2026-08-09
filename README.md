@@ -1,6 +1,6 @@
 # codexmeter
 
-A self-hosted web application that visualises Kimi Code session JSONL transcripts.
+A self-hosted web application that visualises Codex and Kimi Code session transcripts.
 
 ## Overview
 
@@ -12,7 +12,7 @@ The dashboard panels include: Session Burn Rate, Cost by Model, Token Breakdown,
 
 - **Backend**: Python 3.13+, FastAPI, Uvicorn, psycopg3 (with connection pooling)
 - **Frontend**: React 18 (loaded from CDN), in-browser Babel transpilation, vanilla JS/JSX — no webpack, vite, or npm install
-- **Database**: PostgreSQL (two separate DBs: `kimimeter` for app data, external auth DB for user credentials)
+- **Database**: PostgreSQL (two separate DBs: `codexmeter` for app data, external auth DB for user credentials)
 - **Object storage**: Cloudflare R2 via S3-compatible API, or local filesystem mirror (`file://`)
 - **Scheduling**: APScheduler (BackgroundScheduler) for hourly ingest
 - **Serialization**: orjson for fast JSON parsing
@@ -26,7 +26,7 @@ backend/          — FastAPI application
   app.py          — Startup/shutdown, route mounting, static asset serving
   api.py          — REST endpoints
   parse.py        — wire.jsonl → records + ctx_turns
-  pricing.py      — Kimi K2.6 / K2.7 Code rates
+  pricing.py      — shared Codex and Kimi model-rate catalog
   ingest.py       — R2 walk, etag/parser-version reparse decision
   r2.py           — S3 client with file:// fallback for dev
   auth.py         — PBKDF2-SHA256 helpers
@@ -65,8 +65,8 @@ examples/         — Sample systemd service file
 
 ```bash
 # 1. Create the app database and apply schema
-createdb kimimeter
-psql kimimeter -f backend/schema.sql
+createdb codexmeter
+psql codexmeter -f backend/schema.sql
 
 # 2. Configure environment
 cp backend/.env.example .env

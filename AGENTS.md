@@ -19,7 +19,7 @@
   - `parse.py` — wire.jsonl → records + ctx_turns. Mirrors
     the canonical `~/.kimi-code/scripts/parse_wire.py` for turn-based
     StatusUpdate extraction.
-  - `pricing.py` — single source of truth for Kimi K2.6 / K2.7 Code / K3 rates.
+  - `pricing.py` — single source of truth for Codex and Kimi model rates.
     Bump `PARSER_VERSION` in `.env` whenever this changes.
   - `ingest.py` — R2 walk, etag/parser-version reparse decision, persistence
     in two-phase transactions, broadcasts `ingest_done` SSE on success.
@@ -28,7 +28,7 @@
     external auth DB's `users.config`, HMAC-signed session cookies, plus
     a guest-mode sentinel (`user_id=0`, per-process secret).
   - `events.py` — thread-safe SSE broadcaster.
-  - `db.py` — two psycopg pools: `viz_pool` (kimimeter) and `auth_pool`
+  - `db.py` — two psycopg pools: `viz_pool` (codexmeter) and `auth_pool`
     (read-only auth DB). Pools never join across DBs.
     `close_viz_pool()` is the test-teardown hook that drops the cached
     viz pool after repointing DATABASE_URL_VIZ. `sql_literal()` marks

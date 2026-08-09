@@ -34,7 +34,7 @@ def _probe() -> dict:
       const api = eval(
         app.slice(start, topBar)
         + '\n' + app.slice(breakdown, breakdownEnd)
-        + '\n;({backendDashToShape, tokenTotal, tokenPanelDefinitions, computeTokenBreakdown})'
+        + '\n;({backendDashToShape, effectiveTokenTypes, tokenTotal, tokenPanelDefinitions, computeTokenBreakdown})'
       );
 
       const base = {
@@ -83,6 +83,8 @@ def _probe() -> dict:
       console.log(JSON.stringify({
         missingTotal: api.tokenTotal(missing.events, missing.tokenTypes),
         missingCacheRead: missing.events[0].cache_read,
+        explicitEmptyTypes: api.effectiveTokenTypes([]),
+        missingMetadataTypes: api.effectiveTokenTypes(undefined).map(t => t.field),
         richTotal: api.tokenTotal(rich.events, rich.tokenTypes),
         richFields: Object.keys(rich.events[0]).filter(k => k.endsWith('_tokens')).sort(),
         panels: api.tokenPanelDefinitions(rich.tokenTypes).map(p => [p.field, p.label]),
@@ -105,6 +107,10 @@ def test_optional_types_drive_totals_panels_costs_and_validation():
     out = _probe()
     assert out["missingTotal"] == 150
     assert out["missingCacheRead"] == 0
+    assert out["explicitEmptyTypes"] == []
+    assert out["missingMetadataTypes"] == [
+        "input_tokens", "output_tokens", "cache_read_tokens",
+    ]
     assert out["richTotal"] == 153
     assert out["richFields"] == [
         "cache_write_tokens", "input_tokens", "output_tokens",

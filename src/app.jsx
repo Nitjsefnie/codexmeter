@@ -471,7 +471,7 @@ function tokenTypeColor(field) {
 }
 
 function normalizedTokenTypes(payload) {
-  const supplied = Array.isArray(payload.token_types) && payload.token_types.length
+  const supplied = Array.isArray(payload.token_types)
     ? payload.token_types
     : FALLBACK_TOKEN_TYPES.filter(type =>
         (payload.hourly || []).some(row => Object.prototype.hasOwnProperty.call(row, type.field)));
@@ -486,6 +486,10 @@ function normalizedTokenTypes(payload) {
       rate: type.rate == null ? null : String(type.rate),
     };
   });
+}
+
+function effectiveTokenTypes(suppliedTokenTypes) {
+  return Array.isArray(suppliedTokenTypes) ? suppliedTokenTypes : FALLBACK_TOKEN_TYPES;
 }
 
 function tokenTotal(events, tokenTypes) {
@@ -793,8 +797,7 @@ function Dashboard({ synth, models, backendOn, activeProject, activeRange, dashN
     subagentOnlySessions, responseSizes, ctxTraces, bucketS, churnEvents,
     tokenTypes: suppliedTokenTypes,
   } = synth || {};
-  const tokenTypes = (suppliedTokenTypes && suppliedTokenTypes.length)
-    ? suppliedTokenTypes : FALLBACK_TOKEN_TYPES;
+  const tokenTypes = effectiveTokenTypes(suppliedTokenTypes);
   // Placeholder window so the bin-size maths below stays finite pre-data.
   const range = dataRange || { start: Date.now() - 86400000, end: Date.now() };
   const hasBackendByModel = backendByModel && Object.keys(backendByModel).length > 0;
