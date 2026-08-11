@@ -19,7 +19,7 @@ This is preferable to importing Claudit at runtime, which would couple two indep
 ## Goals
 
 1. Ingest both new and previously skipped Claude-format transcripts from the Codex bucket.
-2. Preserve existing Kimi and Codex behavior byte-for-byte at their parser boundaries.
+2. Preserve all existing Kimi and Codex records and metric semantics; the only parser-contract addition is `prompt_count: 0`.
 3. Provide all available metrics: usage and cost, context turns, substantive prompt count, tool calls and errors, edit churn, visible response size, reply latency, and rate-limit hits.
 4. Attribute records from `message.model` and price GPT models through Codexmeter's existing rates, including long-context billing.
 5. Support main and subagent transcripts, plain JSONL and JSONL.XZ.
@@ -158,7 +158,7 @@ The Inspector's `src/parser.js` remains an independent offline parser. Extend it
 - Instrumentation and interrupt records do not count as substantive prompts.
 - Tool calls, matched success/error results, unmatched results, and failed-edit churn behave as in Claudit.
 - Reply latency, text characters, rate-limit hits, and context deltas are retained.
-- Native Codex/Kimi fixtures still select their original parsers and produce unchanged output.
+- Native Codex/Kimi fixtures still select their original parsers and preserve every existing record and metric, with only the additive `prompt_count: 0` contract field.
 
 ### Ingest tests
 
