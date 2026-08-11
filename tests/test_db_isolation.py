@@ -1,7 +1,7 @@
 """A test process must never be pointed at the production database.
 
 backend/app.py loads the repo's .env at import time, and .env names the live
-kimimeter database in DATABASE_URL_VIZ. Nothing but luck kept the suite off it:
+codexmeter database in DATABASE_URL_VIZ. Nothing but luck kept the suite off it:
 every DB-touching test happens to monkeypatch the variable at its own scratch
 database, so the production DSN was never dialled — but any test that forgot
 to, or any module-scope `import backend.app`, would have silently connected to
@@ -19,7 +19,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # The database backend/../.env names. Hardcoded so the check still means
 # something in a checkout that has no .env at all (CI).
-PRODUCTION_DB = "kimimeter"
+PRODUCTION_DB = "codexmeter"
 
 
 def _dbname(dsn: str) -> str:

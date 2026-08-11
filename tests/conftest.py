@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # Claim DATABASE_URL_VIZ before anything can load the repo's .env.
 #
 # backend/app.py calls db.load_dotenv(".env") at IMPORT time, and .env points
-# DATABASE_URL_VIZ at the live kimimeter database. load_dotenv only ever
+# DATABASE_URL_VIZ at the live codexmeter database. load_dotenv only ever
 # setdefault()s, so whoever sets the variable first wins — and conftest is
 # imported before any test module. Claiming it here is therefore enough to
 # keep a test process off production even if some module (now or later)
@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # The ordering is load-bearing: this must run above any import that pulls in
 # a backend module. It is a backstop, not a replacement — DB-touching tests
 # still monkeypatch their own scratch database.
-os.environ.setdefault("DATABASE_URL_VIZ", "postgresql:///kimimeter_test")
+os.environ.setdefault("DATABASE_URL_VIZ", "postgresql:///codexmeter_test")
 # Force file-mode R2 for unit tests; pytest never hits real R2.
 os.environ.setdefault("R2_ENDPOINT", "file:///tmp/kd-test-r2/")
 os.environ.setdefault("R2_BUCKET", "kimi")

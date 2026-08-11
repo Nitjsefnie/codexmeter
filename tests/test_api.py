@@ -41,7 +41,7 @@ def _pg_cur():
         conn.close()
 
 
-def _build_app(monkeypatch, pre_ingest=None, test_db="kimimeter_test_api"):
+def _build_app(monkeypatch, pre_ingest=None, test_db="codexmeter_test_api"):
     """Spin up a fresh DB + mini R2, optionally mutate the temp R2 tree,
     ingest, and yield a TestClient on the api router — then tear it down.
 
@@ -95,7 +95,7 @@ def _app_with_fresh_data():
     contaminate the shared module-scoped client."""
     mp = pytest.MonkeyPatch()
     try:
-        yield from _build_app(mp, test_db="kimimeter_test_api_mut")
+        yield from _build_app(mp, test_db="codexmeter_test_api_mut")
     finally:
         mp.undo()
 
@@ -139,7 +139,7 @@ def _app_with_unresolved():
     mp = pytest.MonkeyPatch()
     try:
         yield from _build_app(
-            mp, pre_ingest=_inject_junk, test_db="kimimeter_test_unres"
+            mp, pre_ingest=_inject_junk, test_db="codexmeter_test_unres"
         )
     finally:
         mp.undo()
@@ -179,7 +179,7 @@ def _app_with_two_models():
     mp = pytest.MonkeyPatch()
     try:
         yield from _build_app(
-            mp, pre_ingest=_inject_early_model, test_db="kimimeter_test_twomodel"
+            mp, pre_ingest=_inject_early_model, test_db="codexmeter_test_twomodel"
         )
     finally:
         mp.undo()
