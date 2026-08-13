@@ -97,10 +97,12 @@ class Phases:
 def _known_model(model: str | None) -> bool:
     """Whether a filter names a model the shared pricing catalog knows.
 
-    Tool rollups intentionally have no model dimension, so this validates
-    the filter without pretending the surviving calls were attributed by it.
+    Tool calls carry their parser-resolved attribution, and this keeps the
+    filter contract limited to the catalog labels the API exposes.
     """
-    return bool(model) and pricing.resolve(model).kind == "exact"
+    return bool(model) and (
+        model == "unknown" or pricing.resolve(model).kind == "exact"
+    )
 
 
 UNRESOLVED_PROJECT_ID = "<unresolved>"
@@ -172,7 +174,7 @@ def _tool_source(bucket_s: int) -> str:
     if bucket_s >= 3600:
         return "tool_rollup t"
     return """(
-      SELECT tu.ts AS hour, f.project_id, tu.tool_name,
+      SELECT tu.ts AS hour, f.project_id, tu.model, tu.tool_name,
              1::bigint AS n_total,
              (CASE WHEN tu.is_error IS NOT NULL THEN 1 ELSE 0 END)::bigint AS n_rated,
              (CASE WHEN tu.is_error THEN 1 ELSE 0 END)::bigint            AS n_error,
@@ -216,22 +218,24 @@ def tool_usage(
     and promotes any tool that ever cracked top-N at any bucket.
     Tools that never make the cut land in 'Other'.
 
-    Tool rollups have no model dimension. A known exact catalog model keeps
-    the shared tool data available; an unknown model returns no buckets.
-    The response must not be interpreted as model-attributed tool usage."""
+    The optional model filter is applied to stored per-call attribution in
+    both the hourly rollup and live source paths. The response remains
+    tool-count shaped, so filtering does not change its public contract."""
     delta = _parse_range(range_)
     since = datetime.now(timezone.utc) - delta
     bucket_s = _bucket_seconds(delta)
-    # Every record carries a model, but tool_uses deliberately does not.
     # Joining `records` to filter by model is BROKEN here because
     # tool_uses.line_num != records.line_num in Kimi wire.jsonl (tool_uses
     # live on ToolCall lines, records on StatusUpdate lines — disjoint sets).
-    # Apply a catalog gate in Python: known model means the shared tool data
-    # remains available; unknown model means an empty result.
+    # Apply the filter to the model captured on each tool-use row instead.
     if model and not _known_model(model):
         return {"range": range_, "project": project, "bucket_s": bucket_s, "buckets": []}
     args: list[Any] = [since]
     proj_filter = _proj_tool(project, args)
+    model_filter = ""
+    if model:
+        args.append(model)
+        model_filter = "AND t.model = %s"
 
     with db.viz_conn() as c:
         rows = c.execute(
@@ -242,7 +246,7 @@ def tool_usage(
                    t.tool_name    AS tool,
                    SUM(t.n_total) AS n
             FROM {_tool_source(bucket_s)}
-            WHERE t.hour >= %s {proj_filter}
+            WHERE t.hour >= %s {proj_filter} {model_filter}
             GROUP BY 1, 2
             ORDER BY 1, 2
             """),
@@ -272,9 +276,9 @@ def tool_error_rate(
     error-rate = n_error / n_total per series and EMA-smooths the
     sequence.
 
-    Tool rollups have no model dimension. A known exact catalog model keeps
-    the shared tool data available; an unknown model returns no buckets.
-    Cross-file uuid dedup does NOT apply — tool_uses aren't keyed on
+    Tool calls carry their event-time model; formats without per-call
+    attribution use `unknown`. Cross-file uuid dedup does NOT apply —
+    tool_uses aren't keyed on
     records.uuid; the natural boundary is per-file."""
     delta = _parse_range(range_)
     since = datetime.now(timezone.utc) - delta
@@ -288,6 +292,10 @@ def tool_error_rate(
         return {"range": range_, "project": project, "bucket_s": bucket_s, "buckets": []}
     args: list[Any] = [since]
     proj_filter = _proj_tool(project, args)
+    model_filter = ""
+    if model:
+        args.append(model)
+        model_filter = "AND t.model = %s"
 
     with db.viz_conn() as c:
         rows = c.execute(
@@ -295,17 +303,17 @@ def tool_error_rate(
             SELECT to_timestamp(
                      floor(EXTRACT(EPOCH FROM t.hour) / {bucket_s}) * {bucket_s} + {bucket_s} / 2
                    ) AS bucket,
-                   %s          AS model,
+                   t.model     AS model,
                    t.tool_name AS tool,
                    SUM(t.n_rated) AS n_total,
                    SUM(t.n_error) AS n_error
             FROM {_tool_source(bucket_s)}
-            WHERE t.hour >= %s {proj_filter}
-            GROUP BY 1, 3
+            WHERE t.hour >= %s {proj_filter} {model_filter}
+            GROUP BY 1, 2, 3
             HAVING SUM(t.n_rated) > 0
-            ORDER BY 1, 3
+            ORDER BY 1, 2, 3
             """),
-            [model or "unknown", *args],
+            args,
         ).fetchall()
 
     return {

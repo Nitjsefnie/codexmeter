@@ -507,9 +507,10 @@ def _failure_summary(failed: list[tuple[str, str]]) -> str | None:
 def rebuild_tool_rollup() -> int:
     """Rebuild `tool_rollup` from tool_uses + files.
 
-    No join to `records`: tool_uses.line_num and records.line_num are
-    disjoint in Kimi wire.jsonl, so there is nothing to match on and no
-    per-tool-call model to record.
+    The parser stores the event-time model on each call. Kimi formats use
+    `unknown`; Codex calls carry their surrounding rollout model. No join to
+    `records` is needed: tool_uses.line_num and records.line_num are
+    disjoint in Kimi wire.jsonl.
 
     n_total counts every tool call (/api/tool-usage), n_rated only the
     settled ones (/api/tool-error-rate's denominator), so one table serves
@@ -529,11 +530,12 @@ def rebuild_tool_rollup() -> int:
         cur = c.execute(
             """
             INSERT INTO tool_rollup (
-              hour, project_id, tool_name, n_total, n_rated, n_error,
+              hour, project_id, model, tool_name, n_total, n_rated, n_error,
               lines_added, lines_deleted
             )
             SELECT date_trunc('hour', tu.ts) AS hour,
                    f.project_id,
+                   tu.model,
                    tu.tool_name,
                    COUNT(*)                                       AS n_total,
                    COUNT(*) FILTER (WHERE tu.is_error IS NOT NULL) AS n_rated,
@@ -543,7 +545,7 @@ def rebuild_tool_rollup() -> int:
               FROM tool_uses tu
               JOIN files f ON f.file_key = tu.file_key
              WHERE tu.ts IS NOT NULL
-             GROUP BY 1, 2, 3
+             GROUP BY 1, 2, 3, 4
             """
         )
         written = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
@@ -947,9 +949,9 @@ def _persist(obj, proj, project_id, session_id, is_main, parsed,
             cur.executemany(
                 """
                 INSERT INTO tool_uses (file_key, line_num, idx, ts, tool_name,
-                  is_error, lines_added, lines_deleted)
+                  model, is_error, lines_added, lines_deleted)
                 VALUES (%(file_key)s, %(line_num)s, %(idx)s, %(ts)s, %(tool_name)s,
-                  %(is_error)s, %(lines_added)s, %(lines_deleted)s)
+                  %(model)s, %(is_error)s, %(lines_added)s, %(lines_deleted)s)
                 """,
                 parsed["tool_uses"],
             )

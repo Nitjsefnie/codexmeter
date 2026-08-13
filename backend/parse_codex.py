@@ -321,7 +321,10 @@ def _codex_tool_call(st: _CodexState, line_num: int, ts: datetime | None,
     else:
         apis = [str(payload.get("name") or "")]
         name = apis[0]
-    _append_tool_use(st, line_num, ts, name, str(payload.get("call_id") or ""))
+    _append_tool_use(
+        st, line_num, ts, name, str(payload.get("call_id") or ""),
+        model=_codex_model(st.model or st.sole_model),
+    )
     if "apply_patch" in apis:
         turn_id = (payload.get("internal_chat_message_metadata_passthrough")
                    or {}).get("turn_id")
@@ -379,7 +382,10 @@ def _codex_patch(st: _CodexState, line_num: int, ts: datetime | None,
         return
     # No tool_call_id: _resolve_tool_errors must leave this row's is_error,
     # which is settled here and nowhere else, alone.
-    _append_tool_use(st, line_num, ts, "apply_patch", "", (added, deleted))
+    _append_tool_use(
+        st, line_num, ts, "apply_patch", "", (added, deleted),
+        model=_codex_model(st.model or st.sole_model),
+    )
     st.tool_uses[-1]["is_error"] = not ok
 
 

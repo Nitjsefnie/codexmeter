@@ -127,7 +127,8 @@ def _line_count(text: object) -> int:
 
 def _append_tool_use(st: _ParseState, line_num: int, ts: datetime | None,
                      tool_name: str, tool_call_id: str,
-                     churn: tuple[int, int] = (0, 0)) -> None:
+                     churn: tuple[int, int] = (0, 0),
+                     model: str = "unknown") -> None:
     added, deleted = churn
     st.tool_uses.append({
         "file_key": st.file_key,
@@ -135,6 +136,7 @@ def _append_tool_use(st: _ParseState, line_num: int, ts: datetime | None,
         "idx": len(st.tool_uses),
         "ts": ts,
         "tool_name": tool_name,
+        "model": model,
         "tool_call_id": tool_call_id,
         "is_error": None,
         "lines_added": added,

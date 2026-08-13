@@ -130,10 +130,11 @@ CREATE INDEX IF NOT EXISTS usage_rollup_project_idx ON usage_rollup (project_id,
 -- endpoints still scanning a raw table per request (tool_uses, joined to
 -- files for the project).
 --
--- No `model` dimension, unlike usage_rollup: in Kimi wire.jsonl
+-- `model` is stored on each tool call at parse time. Codex has an event-time
+-- model in its rollout; formats without per-call attribution use `unknown`.
+-- It cannot be reconstructed by joining `records`: in Kimi wire.jsonl
 -- tool_uses.line_num and records.line_num are disjoint (ToolCall lines vs
--- StatusUpdate lines), so there is no per-tool-call model to join to.
--- Both endpoints already treat model as a whole-dataset constant.
+-- StatusUpdate lines).
 --
 -- The two endpoints count DIFFERENT populations, so both are stored:
 --   n_total  every tool_use in the group           -> /api/tool-usage
@@ -144,13 +145,14 @@ CREATE INDEX IF NOT EXISTS usage_rollup_project_idx ON usage_rollup (project_id,
 CREATE TABLE IF NOT EXISTS tool_rollup (
   hour        TIMESTAMPTZ NOT NULL,
   project_id  TEXT        NOT NULL,
+  model       TEXT        NOT NULL DEFAULT 'unknown',
   tool_name   TEXT        NOT NULL,
   n_total     BIGINT      NOT NULL DEFAULT 0,
   n_rated     BIGINT      NOT NULL DEFAULT 0,
   n_error     BIGINT      NOT NULL DEFAULT 0,
   lines_added   BIGINT    NOT NULL DEFAULT 0,
   lines_deleted BIGINT    NOT NULL DEFAULT 0,
-  PRIMARY KEY (hour, project_id, tool_name)
+  PRIMARY KEY (hour, project_id, model, tool_name)
 );
 CREATE INDEX IF NOT EXISTS tool_rollup_hour_idx ON tool_rollup (hour);
 CREATE INDEX IF NOT EXISTS tool_rollup_project_idx ON tool_rollup (project_id, hour);
@@ -211,6 +213,7 @@ CREATE TABLE IF NOT EXISTS tool_uses (
   idx        INT  NOT NULL,
   ts         TIMESTAMPTZ,
   tool_name  TEXT NOT NULL,
+  model      TEXT NOT NULL DEFAULT 'unknown',
   is_error   BOOLEAN,
   lines_added   BIGINT NOT NULL DEFAULT 0,
   lines_deleted BIGINT NOT NULL DEFAULT 0,
@@ -224,6 +227,16 @@ CREATE TABLE IF NOT EXISTS tool_uses (
 -- no diff — so historical rows stay 0 until a PARSER_VERSION bump
 -- reparses them.
 ALTER TABLE tool_uses ADD COLUMN IF NOT EXISTS
+  model TEXT;
+UPDATE tool_uses SET model = 'unknown' WHERE model IS NULL;
+ALTER TABLE tool_uses ALTER COLUMN model SET DEFAULT 'unknown';
+ALTER TABLE tool_uses ALTER COLUMN model SET NOT NULL;
+ALTER TABLE tool_rollup ADD COLUMN IF NOT EXISTS
+  model TEXT;
+UPDATE tool_rollup SET model = 'unknown' WHERE model IS NULL;
+ALTER TABLE tool_rollup ALTER COLUMN model SET DEFAULT 'unknown';
+ALTER TABLE tool_rollup ALTER COLUMN model SET NOT NULL;
+ALTER TABLE tool_uses ADD COLUMN IF NOT EXISTS
   lines_added BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE tool_uses ADD COLUMN IF NOT EXISTS
   lines_deleted BIGINT NOT NULL DEFAULT 0;
@@ -232,8 +245,37 @@ ALTER TABLE tool_rollup ADD COLUMN IF NOT EXISTS
 ALTER TABLE tool_rollup ADD COLUMN IF NOT EXISTS
   lines_deleted BIGINT NOT NULL DEFAULT 0;
 
+-- The old primary key omitted model. Rebuild it once for databases created
+-- before per-call attribution; subsequent schema runs are no-ops.
+DO $$
+DECLARE
+  old_pk TEXT;
+BEGIN
+  SELECT c.conname INTO old_pk
+    FROM pg_constraint c
+   WHERE c.conrelid = 'tool_rollup'::regclass
+     AND c.contype = 'p'
+     AND pg_get_constraintdef(c.oid) <> 'PRIMARY KEY (hour, project_id, model, tool_name)';
+  IF old_pk IS NOT NULL THEN
+    EXECUTE format('ALTER TABLE tool_rollup DROP CONSTRAINT %I', old_pk);
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_constraint c
+     WHERE c.conrelid = 'tool_rollup'::regclass
+       AND c.contype = 'p'
+       AND pg_get_constraintdef(c.oid) = 'PRIMARY KEY (hour, project_id, model, tool_name)'
+  ) THEN
+    ALTER TABLE tool_rollup
+      ADD PRIMARY KEY (hour, project_id, model, tool_name);
+  END IF;
+END
+$$;
+
 CREATE INDEX IF NOT EXISTS tool_uses_ts_idx   ON tool_uses (ts);
 CREATE INDEX IF NOT EXISTS tool_uses_tool_idx ON tool_uses (tool_name);
+CREATE INDEX IF NOT EXISTS tool_uses_model_idx ON tool_uses (model);
+CREATE INDEX IF NOT EXISTS tool_rollup_model_idx ON tool_rollup (model, hour);
 
 CREATE TABLE IF NOT EXISTS ingest_runs (
   id              BIGSERIAL PRIMARY KEY,

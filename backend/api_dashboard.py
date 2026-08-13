@@ -411,9 +411,9 @@ def _dash_churn_rows(c, q: _DashQuery, ph: Phases) -> list:
     """Lines added/deleted per bucket — two separate POSITIVE series
     (issue #17), read off the same dual-path tool source as the tool
     endpoints: tool_rollup at >= 1h buckets, the live tool_uses
-    subquery below that. No model dimension exists on tool_uses
-    (its line_nums are disjoint from records'), so ?model= does not
-    constrain this series — same caveat the tool endpoints carry."""
+    subquery below that. Although tool_uses now stores per-call model
+    attribution, churn remains intentionally aggregate-only, so ?model=
+    does not constrain this series."""
     args: list[Any] = [q.args[0]]  # since
     proj = _proj_tool(q.project, args)
     return ph.execute(
