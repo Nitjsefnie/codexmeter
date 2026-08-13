@@ -741,35 +741,78 @@ def test_tool_endpoints_rollup_matches_live_path(app_with_fresh_data, monkeypatc
     assert rolled_errors["buckets"] == live_errors["buckets"]
 
 
-def test_tool_endpoints_accept_codex_models_without_inventing_attribution(
-        app_with_fresh_data):
-    """The rollup has no model dimension. A known filter gates the shared
-    data and labels filtered error rows with the request; an unfiltered row
-    must say unknown rather than claiming every call belonged to one model.
+def _insert_tool_model_probe_rows():
+    """Seed two models in one project/hour/tool for attribution tests.
+
+    The compatibility ALTERs let this test run against the pre-fix schema so
+    the RED run fails on the API assertion rather than at database setup.
+    Production schema creation/migration owns these columns after the fix.
     """
-    _insert_tool_probe_rows()
+    with _pg_cur() as cur:
+        cur.execute(
+            "ALTER TABLE tool_uses ADD COLUMN IF NOT EXISTS "
+            "model TEXT NOT NULL DEFAULT 'unknown'"
+        )
+        cur.execute(
+            "ALTER TABLE tool_rollup ADD COLUMN IF NOT EXISTS "
+            "model TEXT NOT NULL DEFAULT 'unknown'"
+        )
+        cur.execute(
+            "INSERT INTO tool_uses (file_key, line_num, idx, ts, tool_name, "
+            "model, is_error) "
+            "SELECT f.file_key, 9200 + i, 0, "
+            "       TIMESTAMPTZ '2026-03-04 05:06:07+00', 'exec_command', "
+            "       CASE WHEN mod(i, 2) = 0 THEN 'gpt-5.6-terra' "
+            "            ELSE 'gpt-5.6-sol' END, "
+            "       CASE WHEN i = 2 THEN TRUE ELSE FALSE END "
+            "FROM files f, generate_series(1, 4) AS i "
+            "WHERE f.file_key = (SELECT MIN(file_key) FROM files)"
+        )
 
-    usage = app_with_fresh_data.get(
-        "/api/tool-usage?range=3650d&model=gpt-5.6-sol"
+    ingest.rebuild_tool_rollup()
+
+
+def test_tool_endpoints_preserve_codex_model_attribution(
+        app_with_fresh_data, monkeypatch):
+    """Rollup and live tool paths retain and filter stored model groups."""
+    _insert_tool_model_probe_rows()
+
+    rolled_usage = app_with_fresh_data.get(
+        "/api/tool-usage?range=3650d"
     ).json()
-    assert usage["buckets"], "a canonical Codex model must pass the gate"
+    rolled_errors = app_with_fresh_data.get(
+        "/api/tool-error-rate?range=3650d"
+    ).json()
+    assert {row["tool"] for row in rolled_usage["buckets"]} == {"exec_command"}
+    assert {row["model"] for row in rolled_errors["buckets"]} == {
+        "gpt-5.6-sol", "gpt-5.6-terra",
+    }
+    assert sum(row["n"] for row in rolled_usage["buckets"]) == 4
+    assert sum(row["n_total"] for row in rolled_errors["buckets"]) == 4
+    assert sum(row["n_error"] for row in rolled_errors["buckets"]) == 1
 
+    filtered_usage = app_with_fresh_data.get(
+        "/api/tool-usage?range=3650d&model=gpt-5.6-terra"
+    ).json()
+    assert sum(row["n"] for row in filtered_usage["buckets"]) == 2
     filtered_errors = app_with_fresh_data.get(
         "/api/tool-error-rate?range=3650d&model=gpt-5.6-terra"
     ).json()["buckets"]
-    assert filtered_errors
     assert {row["model"] for row in filtered_errors} == {"gpt-5.6-terra"}
+    assert sum(row["n_total"] for row in filtered_errors) == 2
+    assert sum(row["n_error"] for row in filtered_errors) == 1
 
-    unfiltered_errors = app_with_fresh_data.get(
-        "/api/tool-error-rate?range=3650d"
-    ).json()["buckets"]
-    assert unfiltered_errors
-    assert {row["model"] for row in unfiltered_errors} == {"unknown"}
-
-    unknown = app_with_fresh_data.get(
-        "/api/tool-usage?range=3650d&model=not-a-real-model"
+    live_source = _tool_source(60)
+    monkeypatch.setattr(api_mod, "_tool_source", lambda bucket_s: live_source)
+    cache.response_cache.clear()
+    live_usage = app_with_fresh_data.get(
+        "/api/tool-usage?range=3650d"
     ).json()
-    assert unknown["buckets"] == []
+    live_errors = app_with_fresh_data.get(
+        "/api/tool-error-rate?range=3650d"
+    ).json()
+    assert rolled_usage["buckets"] == live_usage["buckets"]
+    assert rolled_errors["buckets"] == live_errors["buckets"]
 
 
 def _insert_churn_probe_rows():

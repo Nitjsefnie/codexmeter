@@ -591,6 +591,101 @@ def test_the_long_context_meter_is_off_by_default_for_kimi_records():
 # --------------------------------------------------------------------------
 
 
+def test_codex_tool_uses_preserve_event_time_models_across_a_switch():
+    """Each tool call keeps the model that was active at its event."""
+    lines = [
+        {
+            "timestamp": "2026-06-14T12:00:01.000Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.6-sol"},
+        },
+        {
+            "timestamp": "2026-06-14T12:00:02.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "sol-call",
+                "input": "tools.exec_command({})",
+            },
+        },
+        {
+            "timestamp": "2026-06-14T12:00:03.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "sol-call",
+                "output": "ok",
+            },
+        },
+        {
+            "timestamp": "2026-06-14T12:00:04.000Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.6-terra"},
+        },
+        {
+            "timestamp": "2026-06-14T12:00:05.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "terra-call",
+                "input": "tools.exec_command({})",
+            },
+        },
+        {
+            "timestamp": "2026-06-14T12:00:06.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "terra-call",
+                "output": "ok",
+            },
+        },
+    ]
+    blob = b"".join(orjson.dumps(line) + b"\n" for line in lines)
+
+    out = parse.parse_file("codex/tool_model_switch.jsonl", blob)
+
+    assert [tool_use.get("model") for tool_use in out["tool_uses"]] == [
+        "gpt-5.6-sol", "gpt-5.6-terra",
+    ]
+
+
+def test_codex_tool_use_before_first_declaration_uses_the_sole_model():
+    """A sole declaration backfills a tool call in replayed history."""
+    lines = [
+        {
+            "timestamp": "2026-06-14T12:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "prefix-call",
+                "input": "tools.exec_command({})",
+            },
+        },
+        {
+            "timestamp": "2026-06-14T12:00:02.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "prefix-call",
+                "output": "ok",
+            },
+        },
+        {
+            "timestamp": "2026-06-14T12:00:03.000Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.6-terra"},
+        },
+    ]
+    blob = b"".join(orjson.dumps(line) + b"\n" for line in lines)
+
+    out = parse.parse_file("codex/tool_sole_model.jsonl", blob)
+
+    assert [tool_use.get("model") for tool_use in out["tool_uses"]] == [
+        "gpt-5.6-terra",
+    ]
+
+
 def test_exec_calls_are_named_by_the_api_they_invoke():
     """`exec` is the only custom tool; naming rows after it would collapse
     every shell command, patch and plan update into one bucket."""
@@ -704,7 +799,7 @@ RECORD_KEYS = {
     "reasoning_output_tokens", "cost_usd", "text_chars", "reply_latency_s",
     "ctx_input",
 }
-TOOL_USE_KEYS = {"file_key", "line_num", "idx", "ts", "tool_name",
+TOOL_USE_KEYS = {"file_key", "line_num", "idx", "ts", "tool_name", "model",
                  "is_error", "lines_added", "lines_deleted"}
 
 
