@@ -92,10 +92,20 @@
     display buckets >= 1h. The 24h view buckets at 5 minutes and takes a
     live subquery shaped with the same column names — keep both paths
     behind one set of queries so they cannot drift.
-  - `tool_uses` / `tool_rollup` also carry `lines_added` / `lines_deleted`
-    — edit churn derived at parse time from Edit/Write (kimi-code) and
-    StrReplaceFile/WriteFile (legacy) call ARGS, because the wire's tool
-    results carry no diff. /api/dashboard serves them as the `churn`
+  - `tool_uses` / `tool_rollup` also carry `lines_added` / `lines_deleted`,
+    from three sources of decreasing authority. Codex journals the
+    APPLIED unified diff in `patch_apply_end`, so its patches count what
+    was actually written. The Kimi formats' tool results carry no diff,
+    so Edit/Write (kimi-code) and StrReplaceFile/WriteFile (legacy) are
+    derived from the call ARGS. Shell text — Kimi's Bash/Shell
+    `{command}`, and Codex's `tools.exec_command({cmd})` /
+    `tools.monitor({command:[argv]})` inside the exec program — goes
+    through `backend/bash_churn.py`, which counts only what the text
+    enumerates directly (heredoc bodies written to a file, inline
+    git-apply/patch hunks, literal python replacements) and 0 for
+    anything that would have to be RUN to measure. An applied patch is
+    never counted twice: `apply_patch` is not a shell command, and the
+    inline-patch rule needs a word boundary `apply_patch` does not give. /api/dashboard serves them as the `churn`
     series behind the Lines Added/Deleted panels. tool_uses has no model
     dimension, so `?model=` does not filter churn (same caveat as the
     tool endpoints).

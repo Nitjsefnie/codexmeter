@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 import orjson
 
 from backend import parse_codex
+from backend.bash_churn import bash_churn
 from backend.parse_common import (_append_tool_use, _append_usage_record,
                                   _close_turn, _end_turn, _finish_parse,
                                   _line_count, _mark_assistant_event,
@@ -141,6 +142,8 @@ def _edit_churn(tool_name: str, args: dict) -> tuple[int, int]:
         )
     if tool_name in ("Write", "WriteFile"):
         return (_line_count(args.get("content")), 0)
+    if tool_name in ("Bash", "Shell"):
+        return bash_churn(str(args.get("command") or ""))
     if tool_name == "StrReplaceFile":
         edit = args.get("edit")
         edits = edit if isinstance(edit, list) else [edit]

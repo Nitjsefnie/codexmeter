@@ -24,6 +24,7 @@ plausible.
 | `rollout_model_switch.jsonl` | 48 | a mid-session model switch, `gpt-5.6-sol` through line 28 and `gpt-5.6-terra` from line 29, with `token_count` records on both sides; five turns including one `turn_aborted`; no `session_meta`, so it stands in for a window cut from the middle of a file |
 | `rollout_sole_model_prefix.jsonl` | 25 | five `token_count` records BEFORE the file's only model declaration (line 20) — the backfill case a fork's replayed history creates |
 | `rollout_patch_linked.jsonl` | 29 | seven tool calls (five `exec_command`, two `apply_patch`), each with its output, and both `patch_apply_end` events that belong to the `apply_patch` calls |
+| `rollout_shell_churn.jsonl` | 8 | three exec programs whose shell payloads are the churn: a `cat > ... <<'EOF'` heredoc in a `cmd` string, a `tools.monitor({command:["bash","-lc",...]})` argv array, and a plain pytest run that must count zero. No `patch_apply_end` anywhere, so it isolates text-derived churn from the journalled kind |
 | `rollout_patch_subagent.jsonl` | 11 | a `patch_apply_end` with **no** `apply_patch` tool call anywhere in the file — a subagent's edit, which the parent rollout journals without the call that made it |
 
 ## Invariants an edit must preserve

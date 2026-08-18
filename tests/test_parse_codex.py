@@ -839,3 +839,44 @@ def test_an_empty_file_parses_to_an_empty_result():
     out = parse.parse_file("codex/empty.jsonl", b"")
     assert out == {"records": [], "ctx_turns": [], "turn_count": 0,
                    "rate_limit_hits": [], "tool_uses": []}
+
+
+# --------------------------------------------------------------------------
+# Shell churn inside the JS program
+# --------------------------------------------------------------------------
+
+def test_exec_command_heredoc_churn_is_counted():
+    """Codex's shell text sits one layer in, as the `cmd` argument of a
+    tools.exec_command call. A heredoc written to a file is a write."""
+    out = _parse("rollout_shell_churn.jsonl")
+    by_name = [(t["tool_name"], t["lines_added"], t["lines_deleted"])
+               for t in out["tool_uses"]]
+    assert by_name[0] == ("exec_command", 3, 0)
+
+
+def test_monitor_argv_payload_churn_is_counted():
+    """`monitor` takes command:[argv] rather than a cmd string — the
+    shell payload is positional, and it counts the same."""
+    out = _parse("rollout_shell_churn.jsonl")
+    by_name = [(t["tool_name"], t["lines_added"], t["lines_deleted"])
+               for t in out["tool_uses"]]
+    assert by_name[1] == ("monitor", 1, 0)
+
+
+def test_a_command_that_only_runs_tests_has_no_churn():
+    out = _parse("rollout_shell_churn.jsonl")
+    by_name = [(t["tool_name"], t["lines_added"], t["lines_deleted"])
+               for t in out["tool_uses"]]
+    assert by_name[2] == ("exec_command", 0, 0)
+
+
+def test_an_applied_patch_is_not_also_counted_from_its_program_text():
+    """The rollout journals the applied unified diff in patch_apply_end,
+    which is better evidence than the program that requested it. The
+    inline-patch rule must never fire on a `*** Begin Patch` string too,
+    or every Codex edit is counted twice."""
+    out = _parse("rollout_patch_linked.jsonl")
+    patches = [t for t in out["tool_uses"] if t["tool_name"] == "apply_patch"]
+    assert len(patches) == 2
+    for tool_use in patches:
+        assert (tool_use["lines_added"], tool_use["lines_deleted"]) == (1, 1)
