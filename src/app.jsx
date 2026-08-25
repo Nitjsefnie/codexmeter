@@ -670,7 +670,10 @@ function computeTokenBreakdown(events, tokenTypes) {
       const tokens = optionalFiniteNumber(event, type.field);
       value += tokens;
       if (cost != null && window.rateForModel) {
-        const rates = window.rateForModel(event.model);
+        // event.ts is epoch MILLISECONDS (Date.parse of the bucket hour);
+        // parser.js's rate epochs are seconds. Passing it settles which
+        // side of a dated rate change the bucket belongs to.
+        const rates = window.rateForModel(event.model, event.ts / 1000);
         const rate = rates[type.rate];
         if (typeof rate !== 'number' || !Number.isFinite(rate)) {
           throw new TypeError(`Invalid rate ${type.rate} for ${event.model}`);

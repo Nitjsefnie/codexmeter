@@ -20,14 +20,20 @@ Two directions are covered, because either one alone leaves a hole:
   * the matching behaviour, driven id by id — catches the semantics diverging
     while the tables still agree, which is the case that actually bit.
 
-claudit's copy of this test also pins the dated-rate epochs
-(test_parser_js_exposes_the_same_rate_epochs). codexmeter has no dated rates —
-no DATED_RATES, no RATE_EPOCHS on either side — so that test has no analogue
-here and is deliberately not ported rather than invented.
+Dated rates are the third direction, and the one with the most room to
+drift: the tables can agree, the matcher can agree, and the two halves can
+still disagree about WHEN a rate changed. The GPT-5.6 family repriced twice
+(2026-07-30 for Terra and Luna, 2026-08-21 for Sol), so both the boundary
+instants and the retired rates behind them are pinned here — the epochs
+directly, and the windows by driving ids through both sides at timestamps
+either side of every boundary. Note the unit changes at the process
+boundary: parser.js works in epoch SECONDS throughout, pricing.py in
+timezone-aware datetimes.
 """
 import json
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -36,6 +42,7 @@ from backend import pricing
 
 ROOT = Path(__file__).resolve().parents[1]
 PARSER_JS = ROOT / "src" / "parser.js"
+UTC = timezone.utc
 
 pytestmark = pytest.mark.skipif(
     shutil.which("node") is None, reason="node not available"
@@ -110,6 +117,26 @@ def _cases():
 CASES = _cases()
 
 
+# (model, epoch seconds) probes straddling every boundary in RATE_EPOCHS,
+# plus one well inside the oldest and newest windows. parser.js works in
+# SECONDS throughout (see MODEL_CUTOFF_EPOCH), so that is the unit crossing
+# the process boundary; the Python side converts.
+def _dated_cases():
+    out = []
+    for key in pricing.DATED_RATES:
+        for boundary in pricing.RATE_EPOCHS:
+            at = int(boundary.timestamp())
+            out.append((key, at - 1))
+            out.append((key, at))
+            out.append((key, at + 1))
+        out.append((key, int(pricing.RATE_EPOCHS[0].timestamp()) - 86_400))
+        out.append((key, int(pricing.RATE_EPOCHS[-1].timestamp()) + 86_400))
+    return out
+
+
+DATED_CASES = _dated_cases()
+
+
 def _node_probe():
     """Run the real parser.js under node; return its table and its verdicts.
 
@@ -123,11 +150,16 @@ def _node_probe():
       const src = require('fs').readFileSync({str(PARSER_JS)!r}, 'utf8');
       const tables = eval(src + '\\n;({{ MODEL_RATES, DEFAULT_RATES }})');
       const cases = {json.dumps(CASES)};
+      const dated = {json.dumps(DATED_CASES)};
       console.log(JSON.stringify({{
         table: tables.MODEL_RATES,
         keys: Object.keys(tables.MODEL_RATES),
         defaults: tables.DEFAULT_RATES,
+        epochs: window.rateEpochs,
         results: cases.map((m) => ({{ model: m, rates: window.rateForModel(m) }})),
+        dated: dated.map(([m, t]) => (
+          {{ model: m, at: t, rates: window.rateForModel(m, t) }}
+        )),
       }}));
     """
     proc = subprocess.run(
@@ -155,6 +187,42 @@ def test_parser_js_rate_table_matches_backend_pricing(js):
         for bucket in BUCKETS:
             assert js_rates[bucket] == pytest.approx(py_rates[bucket]), \
                 f"{key}: {bucket}"
+
+
+def test_parser_js_exposes_the_same_rate_epochs(js):
+    """A boundary that drifts between the halves misprices every record
+    between the two spellings of it, and nothing else looks wrong.
+    """
+    js_epochs = [datetime.fromtimestamp(s, tz=UTC) for s in js["epochs"]]
+    assert js_epochs == pricing.RATE_EPOCHS
+
+
+def test_parser_js_dated_lookup_matches_backend_at_every_boundary(js):
+    """The windows themselves, id by id and instant by instant. Covers the
+    off-by-one direction too: the cut instant belongs to the NEW price on
+    both sides, one second earlier to the old one.
+    """
+    got = {(r["model"], r["at"]): r["rates"] for r in js["dated"]}
+    assert len(got) == len(set(DATED_CASES)), "duplicate dated case"
+
+    for model, at in DATED_CASES:
+        ts = datetime.fromtimestamp(at, tz=UTC)
+        want = pricing.rate_for(model, ts)
+        for bucket in BUCKETS:
+            assert got[(model, at)][bucket] == pytest.approx(want[bucket]), \
+                f"{model!r} at {ts.isoformat()}: {bucket}"
+
+
+def test_parser_js_dated_windows_actually_differ_from_list_price(js):
+    """Guards the corpus, not the code: if every dated probe happened to
+    return today's rates, the test above would pass against a JS half that
+    ignores its ts entirely.
+    """
+    differing = [
+        (r["model"], r["at"]) for r in js["dated"]
+        if r["rates"]["output"] != pricing.MODEL_RATES[r["model"]]["output"]
+    ]
+    assert differing, "no dated probe lands in a retired window"
 
 
 def test_parser_js_default_rates_name_the_same_model(js):

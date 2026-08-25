@@ -4,18 +4,44 @@
  */
 
 // Must match backend PARSER_VERSION (see backend/.env.example).
-window.PARSER_VERSION = "12";
+window.PARSER_VERSION = "13";
 
 const MODEL_RATES = {
   "kimi-k3":        { fresh: 3.00, create: 0.00, read: 0.30, output: 15.00 },
   "kimi-k2-7-code": { fresh: 0.95, create: 0.00, read: 0.19, output: 4.00 },
   "kimi-k2-6":      { fresh: 0.95, create: 0.00, read: 0.16, output: 4.00 },
-  "gpt-5.6-sol":    { fresh: 5.00, create: 6.25, read: 0.50, output: 30.00 },
+  "gpt-5.6-sol":    { fresh: 4.00, create: 5.00, read: 0.40, output: 20.00 },
   "gpt-5.6-terra":  { fresh: 2.00, create: 2.50, read: 0.20, output: 12.00 },
   "gpt-5.6-luna":   { fresh: 0.20, create: 0.25, read: 0.02, output: 1.20 },
 };
 
 const DEFAULT_RATES = MODEL_RATES["gpt-5.6-luna"];
+
+// Dated overrides, per exact key. Mirrors backend/pricing.DATED_RATES:
+// endExclusive is a frozen epoch in SECONDS (this file's unit throughout —
+// see MODEL_CUTOFF_EPOCH below), oldest window first, and a lookup takes the
+// first window its timestamp falls before. The GPT-5.6 family repriced
+// twice and each cut moved a different subset, so the boundaries differ per
+// model. Both are the instant of OpenAI's own announcement.
+const JUL30_CUT_EPOCH = 1785435120;  // 2026-07-30 18:12:00 UTC — terra, luna
+const AUG21_CUT_EPOCH = 1787341200;  // 2026-08-21 19:40:00 UTC — sol
+window.datedRates = {
+  "gpt-5.6-sol": [
+    { endExclusive: AUG21_CUT_EPOCH,
+      rates: { fresh: 5.00, create: 6.25, read: 0.50, output: 30.00 } },
+  ],
+  "gpt-5.6-terra": [
+    { endExclusive: JUL30_CUT_EPOCH,
+      rates: { fresh: 2.50, create: 3.125, read: 0.25, output: 15.00 } },
+  ],
+  "gpt-5.6-luna": [
+    { endExclusive: JUL30_CUT_EPOCH,
+      rates: { fresh: 1.00, create: 1.25, read: 0.10, output: 6.00 } },
+  ],
+};
+// Sorted boundaries where any rate changes. Mirrors pricing.RATE_EPOCHS,
+// and tests/test_parser_js_mirror.py asserts the two agree.
+window.rateEpochs = [JUL30_CUT_EPOCH, AUG21_CUT_EPOCH];
 
 // Hardcoded model transitions, oldest first.  Each constant is a frozen UTC
 // epoch, NOT a live expression.  Boundaries are strictly-before /
@@ -112,9 +138,22 @@ function _matchRateKey(norm) {
 // buckets plus the claudit-compatible aliases (out/c5/c1h) app.jsx reads.
 // An id the table cannot match is priced at DEFAULT_RATES — the same
 // fall-back backend/pricing.py resolve() reports as kind="default".
-window.rateForModel = function rateForModel(model) {
+window.rateForModel = function rateForModel(model, ts) {
   const key = _matchRateKey(_normaliseModel(model));
-  const r = key === null ? DEFAULT_RATES : MODEL_RATES[key];
+  let r = key === null ? DEFAULT_RATES : MODEL_RATES[key];
+  if (key !== null) {
+    // Mirrors backend/pricing._dated. A dated window applies only on an
+    // EXACT key match, so the flagged default never inherits some other
+    // model's retired price. Boundaries are strictly-before /
+    // inclusive-at, matching the model cutoffs above.
+    const epoch = tsToEpoch(ts);
+    const windows = window.datedRates[key];
+    if (windows && epoch != null) {
+      for (const w of windows) {
+        if (epoch < w.endExclusive) { r = w.rates; break; }
+      }
+    }
+  }
   return {
     fresh: r.fresh, create: r.create, read: r.read, output: r.output,
     out: r.output, c5: r.create, c1h: 0,
@@ -345,8 +384,9 @@ function _parseLegacy(blob) {
 
     // Legacy transcripts carry no model string, so this resolves by date —
     // but per RECORD, so a session spanning a cutoff splits correctly.
-    const model = modelFor(null, m.ts != null ? m.ts : firstEventTs);
-    const rates = window.rateForModel(model);
+    const recordTs = m.ts != null ? m.ts : firstEventTs;
+    const model = modelFor(null, recordTs);
+    const rates = window.rateForModel(model, recordTs);
     const cost = (
       fresh * rates.fresh / 1e6 +
       create * rates.create / 1e6 +
@@ -653,8 +693,9 @@ function _parseKimiCode(blob) {
     const totalInput = fresh + create + read;
 
     // The wire names the model on every usage.record; honour it, canonicalised.
-    const model = modelFor(m.wire_model, m.ts != null ? m.ts : firstEventTs);
-    const rates = window.rateForModel(model);
+    const recordTs = m.ts != null ? m.ts : firstEventTs;
+    const model = modelFor(m.wire_model, recordTs);
+    const rates = window.rateForModel(model, recordTs);
     const cost = (
       fresh * rates.fresh / 1e6 +
       create * rates.create / 1e6 +
@@ -817,7 +858,7 @@ window.computeSessionStats = function computeSessionStats(events, metaEvents) {
     // exactly as the record builders: a session can span a
     // cutoff or switch model mid-flight, so one session-wide rate would
     // misprice part of it.
-    const r = window.rateForModel(u.model);
+    const r = window.rateForModel(u.model, u.ts);
     stats.cost += (
       u.input * r.fresh / 1e6 +
       u.create * r.create / 1e6 +

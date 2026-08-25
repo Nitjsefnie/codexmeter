@@ -11,9 +11,14 @@ window.generateSyntheticData = function () {
   const events = [];
   const limitHits = [];
 
-  // Pricing per model (USD per token)
+  // Pricing per model (USD per token). Mirrors backend/pricing.MODEL_RATES
+  // at CURRENT list price, asserted by
+  // tests/test_codex_model_constants.py. Deliberately ignores
+  // pricing.DATED_RATES: this timeline is invented (Feb-May 2026, before
+  // the family existed), so there is no real instant for a window to
+  // select and pinning one would only make the preview harder to read.
   const PRICING = {
-    'gpt-5.6-sol':  { in: 5/1e6,   out: 30/1e6,  cc: 6.25/1e6, cr: 0.5/1e6 },
+    'gpt-5.6-sol':  { in: 4/1e6,   out: 20/1e6,  cc: 5/1e6,    cr: 0.4/1e6 },
     'gpt-5.6-terra':{ in: 2/1e6,   out: 12/1e6,  cc: 2.5/1e6,  cr: 0.2/1e6 },
     'gpt-5.6-luna': { in: 0.2/1e6, out: 1.2/1e6, cc: 0.25/1e6, cr: 0.02/1e6 },
     '<synthetic>':  { in: 0, out: 0, cc: 0, cr: 0 },

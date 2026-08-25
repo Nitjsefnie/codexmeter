@@ -1,9 +1,13 @@
 """MODEL_RATES is the single source of truth for cost in this repo.
 Mirrors backend/pricing.py — bump PARSER_VERSION whenever the table changes.
 """
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from backend import pricing
+
+UTC = timezone.utc
 
 
 def test_k2_7_code_rates_match_source():
@@ -22,17 +26,125 @@ def test_k3_rates_match_source():
 
 
 @pytest.mark.parametrize(("model", "want"), [
-    ("gpt-5.6-sol", {"fresh": 5.00, "create": 6.25,
-                     "read": 0.50, "output": 30.00}),
+    ("gpt-5.6-sol", {"fresh": 4.00, "create": 5.00,
+                     "read": 0.40, "output": 20.00}),
     ("gpt-5.6-terra", {"fresh": 2.00, "create": 2.50,
                        "read": 0.20, "output": 12.00}),
     ("gpt-5.6-luna", {"fresh": 0.20, "create": 0.25,
                       "read": 0.02, "output": 1.20}),
 ])
 def test_codex_rates_match_source(model, want):
-    """A Codex label must reach the same table the browser mirrors."""
+    """A Codex label must reach the same table the browser mirrors.
+
+    These are the CURRENT list rates. Everything the family charged before
+    them lives in DATED_RATES; see test_codex_dated_rates_match_source.
+    """
     assert pricing.MODEL_RATES[model] == want
     assert pricing.rate_for(model) is pricing.MODEL_RATES[model]
+
+
+# The GPT-5.6 family repriced twice, and each cut moved a different subset:
+#   2026-07-09  GA          sol 5/30    terra 2.50/15   luna 1/6
+#   2026-07-30  luna -80%, terra -20%   sol untouched
+#   2026-08-21  sol -20% in / -33% out  terra and luna untouched
+# Cached reads are 10% of uncached input and cache writes 1.25x it, in every
+# window of every tier — verified against OpenAI's own Sol table, which
+# prints 4 / 0.4 / 5 / 20.
+BEFORE_JUL30 = datetime(2026, 7, 20, tzinfo=UTC)
+BETWEEN_CUTS = datetime(2026, 8, 10, tzinfo=UTC)
+AFTER_AUG21 = datetime(2026, 8, 24, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(("model", "ts", "want"), [
+    ("gpt-5.6-sol", BEFORE_JUL30, {"fresh": 5.00, "create": 6.25,
+                                   "read": 0.50, "output": 30.00}),
+    ("gpt-5.6-sol", BETWEEN_CUTS, {"fresh": 5.00, "create": 6.25,
+                                   "read": 0.50, "output": 30.00}),
+    ("gpt-5.6-sol", AFTER_AUG21, {"fresh": 4.00, "create": 5.00,
+                                  "read": 0.40, "output": 20.00}),
+    ("gpt-5.6-terra", BEFORE_JUL30, {"fresh": 2.50, "create": 3.125,
+                                     "read": 0.25, "output": 15.00}),
+    ("gpt-5.6-terra", BETWEEN_CUTS, {"fresh": 2.00, "create": 2.50,
+                                     "read": 0.20, "output": 12.00}),
+    ("gpt-5.6-terra", AFTER_AUG21, {"fresh": 2.00, "create": 2.50,
+                                    "read": 0.20, "output": 12.00}),
+    ("gpt-5.6-luna", BEFORE_JUL30, {"fresh": 1.00, "create": 1.25,
+                                    "read": 0.10, "output": 6.00}),
+    ("gpt-5.6-luna", BETWEEN_CUTS, {"fresh": 0.20, "create": 0.25,
+                                    "read": 0.02, "output": 1.20}),
+    ("gpt-5.6-luna", AFTER_AUG21, {"fresh": 0.20, "create": 0.25,
+                                   "read": 0.02, "output": 1.20}),
+])
+def test_codex_dated_rates_match_source(model, ts, want):
+    assert pricing.rate_for(model, ts) == want
+
+
+@pytest.mark.parametrize(("model", "epoch"), [
+    ("gpt-5.6-terra", pricing.JUL30_CUT),
+    ("gpt-5.6-luna", pricing.JUL30_CUT),
+    ("gpt-5.6-sol", pricing.AUG21_CUT),
+])
+def test_a_cut_instant_belongs_to_the_new_price(model, epoch):
+    """Boundaries are strictly-before / inclusive-at, matching the cutoff
+    convention parse.py already uses for the Kimi generations. One
+    microsecond earlier is still the old price.
+    """
+    assert pricing.rate_for(model, epoch) is pricing.MODEL_RATES[model]
+    before = epoch - timedelta(microseconds=1)
+    assert pricing.rate_for(model, before) is not pricing.MODEL_RATES[model]
+
+
+def test_omitting_the_timestamp_yields_current_list_price():
+    """Every caller that has no timestamp — an API filter, a rate display —
+    must get today's price, never a retired one.
+    """
+    for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        assert pricing.rate_for(model) is pricing.MODEL_RATES[model]
+        assert pricing.rate_for(model, None) is pricing.MODEL_RATES[model]
+
+
+def test_a_naive_timestamp_is_read_as_utc():
+    """psycopg can hand back a naive datetime; treating it as local time
+    would move the boundary by the server's offset.
+    """
+    naive = pricing.AUG21_CUT.replace(tzinfo=None) - timedelta(hours=1)
+    assert pricing.rate_for("gpt-5.6-sol", naive)["output"] == 30.00
+
+
+def test_rate_epochs_are_sorted_and_cover_every_window():
+    assert pricing.RATE_EPOCHS == sorted(pricing.RATE_EPOCHS)
+    assert set(pricing.RATE_EPOCHS) == {
+        end for windows in pricing.DATED_RATES.values() for end, _ in windows
+    }
+
+
+def test_a_dated_window_never_leaks_onto_an_unknown_model():
+    """DATED_RATES is keyed by exact table key. An id that only reaches the
+    flagged default must get today's default, not some retired window of
+    whatever model the fallback happens to point at.
+    """
+    for ts in (BEFORE_JUL30, BETWEEN_CUTS, AFTER_AUG21):
+        assert pricing.rate_for("not-a-real-model", ts) is pricing.DEFAULT_RATES
+
+
+def test_a_dated_lookup_still_reports_the_match_as_exact():
+    r = pricing.resolve("gpt-5.6-luna", BEFORE_JUL30)
+    assert r.kind == "exact"
+    assert r.key == "gpt-5.6-luna"
+    assert r.estimated is False
+
+
+def test_compute_cost_bills_a_record_at_the_rate_of_its_own_timestamp():
+    old = pricing.compute_cost(
+        "gpt-5.6-luna", fresh=1_000_000, create=0, read=0, output=0,
+        ts=BEFORE_JUL30,
+    )
+    new = pricing.compute_cost(
+        "gpt-5.6-luna", fresh=1_000_000, create=0, read=0, output=0,
+        ts=BETWEEN_CUTS,
+    )
+    assert old == pytest.approx(1.00, rel=1e-9)
+    assert new == pytest.approx(0.20, rel=1e-9)
 
 
 def test_luna_is_the_flagged_unknown_model_fallback():

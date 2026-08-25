@@ -72,6 +72,35 @@
   before the hardcoded cutoff are labelled `kimi-k2-6`; newer sessions are
   `kimi-k2-7-code`. `cache_creation` is billed at a flat rate (no TTL split in
   Kimi wire format).
+- **SV-DATED-RATES — a Codex rate depends on WHEN the tokens were spent.**
+  `MODEL_RATES` holds current list price; every rate the GPT-5.6 family
+  charged before it is a window in `pricing.DATED_RATES`, keyed by exact
+  model and ended by a frozen UTC instant (strictly-before / inclusive-at,
+  so a cut instant is the new price). Terra and Luna were cut 2026-07-30,
+  Sol 2026-08-21; the two boundaries are `pricing.RATE_EPOCHS`. Anything
+  that prices a record passes that record's own `ts` — `compute_cost`,
+  `rate_for` and `resolve` all take one and fall back to list price
+  without it.
+  - **Read paths that re-derive cost from SUMMED tokens must group by
+    `RATE_EPOCHS`**, via `api.rate_epoch_sql` / `api.epoch_ts` /
+    `api.fold_per_model`. `cost_total` comes from `SUM(cost_usd)` and is
+    always right; `cost_buckets` is re-derived, so a range straddling a cut
+    silently stops adding up to the total it decomposes. The epoch index is
+    shared across models but selects a different window per model — epoch 1
+    is post-cut for Luna and pre-cut for Sol.
+  - **Mirrored in `src/parser.js` and `src/synthetic-data.js`**, so a rate
+    edit is a three-file change. parser.js carries `window.datedRates` and
+    `window.rateEpochs` in epoch SECONDS and
+    `tests/test_parser_js_mirror.py` pins both against the Python;
+    synthetic-data.js deliberately carries list price only, its timeline
+    being invented.
+- **SV-SUBSCRIPTION-METER — a Codex rollout on a ChatGPT plan is never
+  billed on the long-context meter.** The 2x-input / 1.5x-output tier over
+  272K tokens is an API-billing thing; the subscription rate card has one
+  short-context column and no long-context one. `_codex_token_count` sets
+  a sticky flag off `rate_limits.plan_type` and passes `long_context` only
+  when no plan was ever named — the pay-as-you-go shape, where the meter is
+  real. Every token_count in the local corpus names `pro`.
 - **SV-CANONICAL-FLAG — cross-file uuid dedup is resolved at INGEST.**
   `records.is_canonical` marks the row that
   `DISTINCT ON (uuid) ORDER BY uuid, file_key, line_num` would have kept;

@@ -22,6 +22,7 @@ from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
 from backend import db, events, pricing
+from backend.api_rates import fold_per_model, rate_epoch_sql
 from backend.cache import cache_response
 
 
@@ -793,33 +794,6 @@ def _iso(v) -> str | None:
     return str(v)
 
 
-def _per_model_row(row) -> dict:
-    model, turns, fresh, cr, output, cost = row
-    fresh = int(fresh or 0)
-    cr = int(cr or 0)
-    output = int(output or 0)
-    rates = pricing.rate_for(model)
-    f_cost = fresh * rates["fresh"] / 1_000_000
-    rd_cost = cr * rates["read"] / 1_000_000
-    o_cost = output * rates["output"] / 1_000_000
-    total_in = fresh + cr
-    return {
-        "model": model,
-        "turns": int(turns or 0),
-        "fresh": fresh,
-        "cache_read": cr,
-        "output": output,
-        "estimated_rate": pricing.resolve(model).estimated,
-        "hit_rate_pct": round((cr / total_in * 100.0) if total_in else 0.0, 1),
-        "cost_total": round(float(cost or 0), 4),
-        "cost_buckets": {
-            "fresh": round(f_cost, 4),
-            "read": round(rd_cost, 4),
-            "output": round(o_cost, 4),
-        },
-    }
-
-
 def _session_total(per_model: list) -> dict:
     total = {
         "turns": sum(m["turns"] for m in per_model),
@@ -855,6 +829,63 @@ def _top_rows(rows, columns) -> list:
                 d[col] = int(v or 0)
         out.append(d)
     return out
+
+
+def _cache_queries(c, ph: Phases, canon_src: str,
+                   canon_args: list) -> tuple:
+    """per_model plus the two top-10 queries, against one connection.
+
+    Split out of cache_view purely to keep its local count under the lint
+    ceiling; the queries share canon_src and belong together.
+    """
+    epoch_expr, epoch_params = rate_epoch_sql("ts")
+    per_model_rows = ph.execute(
+        "per_model", c,
+        db.sql_literal(f"""
+        SELECT model,
+               ({epoch_expr})              AS rate_epoch,
+               COUNT(*)                    AS turns,
+               SUM(fresh_tokens)           AS fresh,
+               SUM(cache_read_tokens)      AS cache_read,
+               SUM(output_tokens)          AS output,
+               SUM(cost_usd)               AS cost_total
+        {canon_src}
+        GROUP BY model, rate_epoch
+        ORDER BY cost_total DESC
+        """),
+        # The CASE parameters sit in the SELECT list, ahead of every
+        # parameter the WHERE clause binds.
+        epoch_params + canon_args,
+    ).fetchall()
+
+    top_output = ph.execute(
+        "top_output", c,
+        db.sql_literal(f"""
+        SELECT ts, line_num, model,
+               output_tokens, cache_read_tokens,
+               fresh_tokens, cost_usd, file_key
+        {canon_src}
+        ORDER BY output_tokens DESC
+        LIMIT 10
+        """),
+        canon_args,
+    ).fetchall()
+
+    top_read = ph.execute(
+        "top_read", c,
+        db.sql_literal(f"""
+        SELECT ts, line_num, model,
+               cache_read_tokens,
+               output_tokens, fresh_tokens,
+               cost_usd, file_key
+        {canon_src}
+          AND cache_read_tokens > 0
+        ORDER BY cache_read_tokens DESC
+        LIMIT 10
+        """),
+        canon_args,
+    ).fetchall()
+    return per_model_rows, top_output, top_read
 
 
 @router.get("/cache")
@@ -905,53 +936,12 @@ def cache_view(
     """
 
     with db.viz_conn() as c:
-        per_model_rows = ph.execute(
-            "per_model", c,
-            db.sql_literal(f"""
-            SELECT model,
-                   COUNT(*)                    AS turns,
-                   SUM(fresh_tokens)           AS fresh,
-                   SUM(cache_read_tokens)      AS cache_read,
-                   SUM(output_tokens)          AS output,
-                   SUM(cost_usd)               AS cost_total
-            {canon_src}
-            GROUP BY model
-            ORDER BY cost_total DESC
-            """),
-            canon_args,
-        ).fetchall()
-
-        top_output = ph.execute(
-            "top_output", c,
-            db.sql_literal(f"""
-            SELECT ts, line_num, model,
-                   output_tokens, cache_read_tokens,
-                   fresh_tokens, cost_usd, file_key
-            {canon_src}
-            ORDER BY output_tokens DESC
-            LIMIT 10
-            """),
-            canon_args,
-        ).fetchall()
-
-        top_read = ph.execute(
-            "top_read", c,
-            db.sql_literal(f"""
-            SELECT ts, line_num, model,
-                   cache_read_tokens,
-                   output_tokens, fresh_tokens,
-                   cost_usd, file_key
-            {canon_src}
-              AND cache_read_tokens > 0
-            ORDER BY cache_read_tokens DESC
-            LIMIT 10
-            """),
-            canon_args,
-        ).fetchall()
+        per_model_rows, top_output, top_read = _cache_queries(
+            c, ph, canon_src, canon_args)
 
     ph.done(range=range_, project=project, model=model)
 
-    per_model = [_per_model_row(r) for r in per_model_rows]
+    per_model = fold_per_model(per_model_rows)
 
     return {
         "range": range_,

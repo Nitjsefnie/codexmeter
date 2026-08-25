@@ -23,6 +23,7 @@ The four assertions the format demands, each with its own section below:
 Expected numbers are read off the fixtures' own raw fields and quoted in
 the test that uses them, so a failure says which field moved.
 """
+from datetime import timedelta
 from pathlib import Path
 
 import orjson
@@ -248,6 +249,7 @@ def test_a_session_that_switches_model_is_priced_at_both_rates():
             rec["model"],
             fresh=rec["fresh_tokens"], create=rec["cache_creation_tokens"],
             read=rec["cache_read_tokens"], output=rec["output_tokens"],
+            ts=rec["ts"],
         )
         assert rec["cost_usd"] == pytest.approx(round(expected, 6), rel=1e-9)
     models = {r["model"] for r in out["records"]}
@@ -403,6 +405,7 @@ def test_reasoning_tokens_do_not_change_what_a_record_costs():
             rec["model"],
             fresh=rec["fresh_tokens"], create=rec["cache_creation_tokens"],
             read=rec["cache_read_tokens"], output=rec["output_tokens"],
+            ts=rec["ts"],
         )
         assert rec["cost_usd"] == pytest.approx(round(expected, 6), rel=1e-9)
 
@@ -430,7 +433,10 @@ def test_cache_write_tokens_are_billed_on_their_own_meter():
     assert rates["create"] > rates["fresh"] > rates["read"]
     write_only = pricing.compute_cost(
         "gpt-5.6-sol", fresh=0, create=1_000_000, read=0, output=0)
-    assert write_only == pytest.approx(6.25, rel=1e-9)
+    assert write_only == pytest.approx(rates["create"], rel=1e-9)
+    # The ratio holds in the retired window too, at 1.25 x the old 5.00.
+    old = pricing.rate_for("gpt-5.6-sol", pricing.AUG21_CUT - timedelta(1))
+    assert old["create"] == pytest.approx(old["fresh"] * 1.25)
 
 
 def _with_cache_write(name: str, written: int) -> bytes:
@@ -504,7 +510,7 @@ def test_a_cache_write_is_billed_at_its_own_rate_not_at_fresh_input_rates():
     # Same prompt, but half its uncached part written to cache at 1.25x
     # instead of billed as fresh input at 1x — so it costs strictly MORE.
     assert rec["cost_usd"] > plain["cost_usd"]
-    rates = pricing.MODEL_RATES["gpt-5.6-sol"]
+    rates = pricing.rate_for("gpt-5.6-sol", rec["ts"])
     expected_delta = written * (rates["create"] - rates["fresh"]) / 1_000_000
     assert rec["cost_usd"] - plain["cost_usd"] == pytest.approx(
         expected_delta, abs=1e-6)
