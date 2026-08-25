@@ -29,8 +29,8 @@ import orjson
 import pytest
 
 from backend import parse, pricing
-from backend.parse_codex import (_codex_declared_models, _codex_model,
-                                 _diff_churn)
+from backend.parse_codex import (_change_churn, _codex_declared_models,
+                                 _codex_model, _diff_churn)
 
 
 FIX = Path(__file__).resolve().parents[1] / "fixtures" / "codex"
@@ -734,6 +734,76 @@ def test_a_subagents_patch_is_recorded_even_with_no_tool_call_to_attach_to():
 ])
 def test_diff_churn_counts_changed_lines_not_headers(diff, expected):
     assert _diff_churn(diff) == expected
+
+
+# --------------------------------------------------------------------------
+# The item_completed rewrap (Codex >= 2026-08-18)
+# --------------------------------------------------------------------------
+
+
+def test_a_filechange_item_is_counted_as_churn():
+    """From 2026-08-18 Codex stopped emitting event_msg/patch_apply_end and
+    began wrapping the same content in event_msg/item_completed with an
+    item.type of FileChange. A parser that only knows the old discriminator
+    books every patch at zero lines, silently: the rows still appear, the
+    churn is just gone."""
+    out = _parse("rollout_item_completed.jsonl")
+    patches = [t for t in out["tool_uses"] if t["tool_name"] == "apply_patch"]
+    assert [(t["lines_added"], t["lines_deleted"]) for t in patches] == [
+        (3, 3),   # update +1/-1, add of 2 lines, delete of 2 lines
+        (0, 0),   # status=failed changed nothing
+        (4, 0),   # a 4-line file added
+    ]
+
+
+def test_an_added_or_deleted_file_carries_content_not_a_diff():
+    """`add` and `delete` changes have no unified_diff at all — the whole
+    file body is under `content`. Counting only unified_diff drops them, and
+    on the reference corpus adds and deletes are 44% of all changes."""
+    out = _parse("rollout_item_completed.jsonl")
+    linked = [t for t in out["tool_uses"] if t["tool_name"] == "apply_patch"][0]
+    # 1 diff line + 2 added-file lines; 1 diff line + 2 deleted-file lines.
+    assert (linked["lines_added"], linked["lines_deleted"]) == (3, 3)
+
+
+def test_a_failed_filechange_contributes_no_churn_and_is_an_error():
+    out = _parse("rollout_item_completed.jsonl")
+    failed = [t for t in out["tool_uses"] if t["is_error"]]
+    assert len(failed) == 1
+    assert (failed[0]["lines_added"], failed[0]["lines_deleted"]) == (0, 0)
+
+
+def test_filechange_churn_lands_on_the_apply_patch_call_of_the_same_turn():
+    """item.id is "exec-<uuid>" and shares no namespace with call_id (0 of
+    2,623 FileChange ids matched a call_id on the reference corpus), so the
+    turn carries the attribution exactly as patch_apply_end's did."""
+    out = _parse("rollout_item_completed.jsonl")
+    assert len(out["tool_uses"]) == 3
+    linked = out["tool_uses"][0]
+    assert linked["tool_name"] == "apply_patch"
+    assert linked["is_error"] is False
+    assert (linked["lines_added"], linked["lines_deleted"]) == (3, 3)
+
+
+def test_an_agentmessage_item_is_counted_as_assistant_text():
+    """event_msg/agent_message became item_completed/AgentMessage in the same
+    release, so Response Sizes reads zero for every session after it."""
+    out = _parse("rollout_item_completed.jsonl")
+    assert sum(rec["text_chars"] for rec in out["records"]) == 138
+
+
+@pytest.mark.parametrize("change,expected", [
+    ({"type": "update", "unified_diff": "@@ -1 +1,2 @@\n-a\n+b\n+c\n"},
+     (2, 1)),
+    ({"type": "add", "content": "one\ntwo\nthree\n"}, (3, 0)),
+    ({"type": "delete", "content": "one\ntwo\n"}, (0, 2)),
+    ({"type": "add", "content": ""}, (0, 0)),
+    ({"type": "update", "unified_diff": None, "move_path": "/b"}, (0, 0)),
+    ({}, (0, 0)),
+])
+def test_change_churn_reads_whichever_field_the_change_type_carries(
+        change, expected):
+    assert _change_churn(change) == expected
 
 
 # --------------------------------------------------------------------------

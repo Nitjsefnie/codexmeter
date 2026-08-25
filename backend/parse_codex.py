@@ -6,6 +6,15 @@ turn_context, event_msg, response_item, world_state, compacted,
 inter_agent_communication_metadata; event_msg and response_item carry a
 second discriminator in payload.type.
 
+TWO SPELLINGS OF THE SAME EVENTS. Codex 2026-08-18 rewrapped part of the
+event_msg set as `item_completed` envelopes discriminated by `item.type`,
+and stopped emitting the flat spelling: patch_apply_end became a FileChange
+item and agent_message an AgentMessage item. Files before and after that
+line are both in the corpus and neither mixes the two, so both spellings are
+read — see _codex_item_completed. The rest of the event_msg set
+(token_count, task_started, task_complete, turn_aborted,
+thread_settings_applied) was not rewrapped.
+
 Entry point is backend.parse.parse_file, which detects the format and calls
 parse() here. The return shape is identical to the Kimi parsers' — see
 parse_file's docstring, which is the contract for all three.
@@ -183,8 +192,7 @@ def _diff_churn(diff: object) -> tuple[int, int]:
 
     Unlike the Kimi formats, whose tool results carry no diff and whose churn
     has to be inferred from the CALL's arguments, Codex journals the applied
-    unified diff in patch_apply_end — so this counts what was actually
-    written, not what was requested.
+    diff — so this counts what was actually written, not what was requested.
     """
     added = deleted = 0
     for line in str(diff or "").splitlines():
@@ -193,6 +201,25 @@ def _diff_churn(diff: object) -> tuple[int, int]:
         elif line.startswith("-") and not line.startswith("---"):
             deleted += 1
     return added, deleted
+
+
+def _change_churn(change: dict) -> tuple[int, int]:
+    """(lines_added, lines_deleted) for one entry of a patch's `changes`.
+
+    Only an `update` carries a unified_diff. An `add` and a `delete` carry
+    the whole file body under `content` instead, and reading unified_diff
+    alone books them at zero — 1,355 of the 3,084 changes on the reference
+    corpus (2026-08-20..25) are one of those two, so it is not an edge case.
+    A pure rename is an `update` whose unified_diff is absent: no line moved.
+    """
+    if change.get("unified_diff") is not None:
+        return _diff_churn(change.get("unified_diff"))
+    lines = len(str(change.get("content") or "").splitlines())
+    if change.get("type") == "add":
+        return lines, 0
+    if change.get("type") == "delete":
+        return 0, lines
+    return 0, 0
 
 
 _CODEX_CMD_STR = re.compile(r"""["']?cmd["']?\s*:\s*(?=")""")
@@ -410,13 +437,19 @@ def _codex_tool_result(st: _CodexState, payload: dict) -> None:
 
 
 def _codex_patch(st: _CodexState, line_num: int, ts: datetime | None,
-                 payload: dict) -> None:
-    """Attribute one patch_apply_end's line churn.
+                 ok: bool, changes: object, turn_id: object) -> None:
+    """Attribute one applied patch's line churn.
 
-    patch_apply_end does NOT share a call_id namespace with the tool calls
-    (0 of 1,727 patch call_ids match one — patches carry "exec-<uuid>" ids),
-    so the churn is carried back onto the most recent apply_patch call of the
-    SAME turn. One exec can apply several patches; they sum onto that call.
+    Called for both spellings of the same event — the `patch_apply_end`
+    event_msg, and the `FileChange` item of the `item_completed` event_msg
+    that replaced it (see _codex_item_completed). The caller resolves the
+    success flag and the changes map; everything below is common to both.
+
+    A patch does NOT share a call_id namespace with the tool calls (0 of
+    1,727 patch call_ids matched one in the old spelling, 0 of 2,623
+    FileChange item ids in the new — both carry "exec-<uuid>"), so the churn
+    is carried back onto the most recent apply_patch call of the SAME turn.
+    One exec can apply several patches; they sum onto that call.
 
     Where no such call exists in this file the patch came from a subagent,
     whose tool calls the parent rollout does not record (522 of the 524
@@ -427,16 +460,15 @@ def _codex_patch(st: _CodexState, line_num: int, ts: datetime | None,
     A failed patch changed nothing, so it contributes no churn — the same
     rule _resolve_tool_errors applies to a rejected edit.
     """
-    ok = bool(payload.get("success"))
     added = deleted = 0
-    if ok:
-        for change in (payload.get("changes") or {}).values():
+    if ok and isinstance(changes, dict):
+        for change in changes.values():
             if isinstance(change, dict):
-                a, d = _diff_churn(change.get("unified_diff"))
+                a, d = _change_churn(change)
                 added += a
                 deleted += d
     target = st.patch_target
-    if target is not None and target[1] == payload.get("turn_id"):
+    if target is not None and target[1] == turn_id:
         tool_use = st.tool_uses[target[0]]
         tool_use["lines_added"] += added
         tool_use["lines_deleted"] += deleted
@@ -448,6 +480,50 @@ def _codex_patch(st: _CodexState, line_num: int, ts: datetime | None,
         model=_codex_model(st.model or st.sole_model),
     )
     st.tool_uses[-1]["is_error"] = not ok
+
+
+def _codex_item_completed(st: _CodexState, line_num: int,
+                          ts: datetime | None, payload: dict) -> None:
+    """Route one item_completed to the handler for its item type.
+
+    Codex 2026-08-18 rewrapped several event_msg payloads as `item_completed`
+    envelopes discriminated by `item.type`, and stopped emitting the flat
+    ones. The two spellings are disjoint per file — no file among the 287 on
+    this box holds both — so handling each is not double counting.
+
+    Only the two items that carry measured quantities are read here.
+    CommandExecution restates the response_item/custom_tool_call that
+    _codex_tool_call already books; counting it too would double every tool
+    row. Reasoning, UserMessage, SubAgentActivity, ContextCompaction,
+    Extension, ImageView and CollabAgentToolCall have no counterpart in the
+    old event_msg set and are not counted by either spelling.
+    """
+    item = payload.get("item")
+    if not isinstance(item, dict):
+        return
+    itype = item.get("type")
+    if itype == "FileChange":
+        # `status` replaces patch_apply_end's boolean `success`; the only
+        # other value observed on an item is "failed".
+        _codex_patch(st, line_num, ts, item.get("status") == "completed",
+                     item.get("changes"), payload.get("turn_id"))
+    elif itype == "AgentMessage":
+        st.text_chars_since_turn += len(_codex_item_text(item))
+        _mark_assistant_event(st)
+
+
+def _codex_item_text(item: dict) -> str:
+    """Flatten an item's `content` list into one string.
+
+    Unlike a response_item's content chunks, whose discriminator is the
+    lowercase "text", an item's are typed "Text" — matching on the
+    discriminator rather than reading the field would silently return "".
+    """
+    parts = []
+    for chunk in (item.get("content") or []):
+        if isinstance(chunk, dict) and chunk.get("text"):
+            parts.append(str(chunk["text"]))
+    return "\n".join(parts)
 
 
 def _codex_event_msg(st: _CodexState, ptype: str, line_num: int,
@@ -466,7 +542,10 @@ def _codex_event_msg(st: _CodexState, ptype: str, line_num: int,
         st.text_chars_since_turn += len(str(payload.get("message") or ""))
         _mark_assistant_event(st)
     elif ptype == "patch_apply_end":
-        _codex_patch(st, line_num, ts, payload)
+        _codex_patch(st, line_num, ts, bool(payload.get("success")),
+                     payload.get("changes"), payload.get("turn_id"))
+    elif ptype == "item_completed":
+        _codex_item_completed(st, line_num, ts, payload)
     elif ptype == "thread_settings_applied":
         model = (payload.get("thread_settings") or {}).get("model")
         if model:

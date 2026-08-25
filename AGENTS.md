@@ -94,8 +94,13 @@
     behind one set of queries so they cannot drift.
   - `tool_uses` / `tool_rollup` also carry `lines_added` / `lines_deleted`,
     from three sources of decreasing authority. Codex journals the
-    APPLIED unified diff in `patch_apply_end`, so its patches count what
-    was actually written. The Kimi formats' tool results carry no diff,
+    APPLIED patch, so its patches count what was actually written — as a
+    `patch_apply_end` event_msg before 2026-08-18 and as the `FileChange`
+    item of an `item_completed` event_msg after it, the two being disjoint
+    per file. A change of type `update` carries a `unified_diff`; `add` and
+    `delete` carry the whole file body under `content` instead, and reading
+    only the diff books 44% of all changes at zero. The Kimi formats' tool
+    results carry no diff,
     so Edit/Write (kimi-code) and StrReplaceFile/WriteFile (legacy) are
     derived from the call ARGS. Shell text — Kimi's Bash/Shell
     `{command}`, and Codex's `tools.exec_command({cmd})` /

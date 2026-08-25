@@ -5,14 +5,15 @@ of anyone's session: the prompts, replies, reasoning summaries, commands,
 paths, diffs and ids are all invented, and the timestamps are a round
 sequence starting at `2026-06-14T12:00:00Z`. They describe one toy
 project at `/workspace/toy-project` — a `greeter` module and its tests —
-carried across all five files so they read as one corpus.
+carried across all seven files so they read as one corpus.
 
 What is *not* invented is the grammar. Record `type` values
 (`session_meta`, `turn_context`, `event_msg`, `response_item`,
 `world_state`, `compacted`, `inter_agent_communication_metadata`), the
-`payload.type` discriminators, the field names, and the arithmetic
-relating `total_token_usage` to `last_token_usage` are reproduced as
-`~/.codex/sessions/**/rollout-*.jsonl` emits them. A fixture that stops
+`payload.type` discriminators — including the `item.type` second
+discriminator the `item_completed` envelope adds — the field names, and
+the arithmetic relating `total_token_usage` to `last_token_usage` are
+reproduced as `~/.codex/sessions/**/rollout-*.jsonl` emits them. A fixture that stops
 reproducing the format is worse than no fixture, so the numbers below are
 chosen to keep the parser's four costly properties (see the module
 docstring of `backend/parse_codex.py`) detectable rather than to look
@@ -26,6 +27,7 @@ plausible.
 | `rollout_patch_linked.jsonl` | 29 | seven tool calls (five `exec_command`, two `apply_patch`), each with its output, and both `patch_apply_end` events that belong to the `apply_patch` calls |
 | `rollout_shell_churn.jsonl` | 8 | three exec programs whose shell payloads are the churn: a `cat > ... <<'EOF'` heredoc in a `cmd` string, a `tools.monitor({command:["bash","-lc",...]})` argv array, and a plain pytest run that must count zero. No `patch_apply_end` anywhere, so it isolates text-derived churn from the journalled kind |
 | `rollout_patch_subagent.jsonl` | 11 | a `patch_apply_end` with **no** `apply_patch` tool call anywhere in the file — a subagent's edit, which the parent rollout journals without the call that made it |
+| `rollout_item_completed.jsonl` | 15 | the post-2026-08-18 spelling: two `item_completed` `FileChange` items — one linked to an `apply_patch` call by turn, one `status: "failed"` and one unlinked — carrying all three change types (`update` with a `unified_diff`, `add` and `delete` with `content`), plus two `AgentMessage` items in place of `agent_message`. No `patch_apply_end` and no `event_msg/agent_message`, because no real file mixes the spellings |
 
 ## Invariants an edit must preserve
 
@@ -50,7 +52,12 @@ being able to catch a wrong parser, which is what these rules are for.
    slip past the assertions.
 5. **Model declarations must sit between the requests they govern**, and
    `token_count` payloads must never name a model of their own.
-6. **Requests within a thread must land on distinct cumulative totals**,
+6. **The two spellings must stay unmixed.** `rollout_item_completed.jsonl`
+   carries no `patch_apply_end` and no `event_msg/agent_message`, and the
+   other six carry no `item_completed`. Adding one to the other side would
+   assert a file shape Codex has never emitted, and would hide a parser
+   that double-counts a patch it sees twice.
+7. **Requests within a thread must land on distinct cumulative totals**,
    because `<session_id>:<total_tokens>` is the record uuid that dedups a
    replayed request across files.
 
@@ -67,6 +74,13 @@ being able to catch a wrong parser, which is what these rules are for.
 - **A rate-limit hit.** `rate_limit_reached_type` and
   `spend_control_reached` ride every `token_count` payload and are null
   on every one of them, as they were on every payload measured.
+- **An item type that carries no measurement.** `Reasoning`,
+  `CommandExecution`, `UserMessage`, `SubAgentActivity`,
+  `ContextCompaction`, `Extension`, `ImageView` and `CollabAgentToolCall`
+  are all real `item_completed` items, and the parser reads none of them —
+  `CommandExecution` in particular restates a `custom_tool_call` that is
+  already booked, so a fixture carrying one would only be able to catch a
+  double count that the tool-call assertions already catch.
 
 ## Placeholders
 
@@ -77,4 +91,5 @@ ciphertext, nothing decrypts it, and the parser never reads the field.
 
 Ids follow the format's shapes without being drawn from it: threads and
 turns are UUID-shaped runs of zeros (`00000000-0000-4000-8000-…`), and
-tool calls, messages and reasoning items carry a `_synth_` infix.
+tool calls, messages and reasoning items carry a `_synth_` infix, and
+an item's `exec-`-prefixed id is a zero-run UUID of the same shape.
