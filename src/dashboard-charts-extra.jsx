@@ -14,6 +14,11 @@ const MODEL_CAPS = {
   'kimi-k3':          256_000,
   'kimi-k2-7-code':   256_000,
   'kimi-k2-6':        256_000,
+  // Astra's published window is 1.05M, but a ChatGPT subscription — which
+  // is what every rollout in this corpus runs on — is capped at 272k, and
+  // the rollouts confirm it. Charting the API ceiling would flatten every
+  // session against a limit no session here can reach.
+  'gpt-6-astra':      272_000,
   'gpt-5.6-sol':      272_000,
   'gpt-5.6-terra':    272_000,
   'gpt-5.6-luna':     272_000,

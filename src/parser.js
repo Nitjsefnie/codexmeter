@@ -4,12 +4,15 @@
  */
 
 // Must match backend PARSER_VERSION (see backend/.env.example).
-window.PARSER_VERSION = "13";
+window.PARSER_VERSION = "14";
 
 const MODEL_RATES = {
   "kimi-k3":        { fresh: 3.00, create: 0.00, read: 0.30, output: 15.00 },
   "kimi-k2-7-code": { fresh: 0.95, create: 0.00, read: 0.19, output: 4.00 },
   "kimi-k2-6":      { fresh: 0.95, create: 0.00, read: 0.16, output: 4.00 },
+  // GPT-6. A separate family from the GPT-5.6 tiers below, and the current
+  // flagship at 2.5x Sol. No window.datedRates entry: one price so far.
+  "gpt-6-astra":    { fresh: 10.00, create: 12.50, read: 1.00, output: 50.00 },
   "gpt-5.6-sol":    { fresh: 4.00, create: 5.00, read: 0.40, output: 20.00 },
   "gpt-5.6-terra":  { fresh: 2.00, create: 2.50, read: 0.20, output: 12.00 },
   "gpt-5.6-luna":   { fresh: 0.20, create: 0.25, read: 0.02, output: 1.20 },

@@ -69,11 +69,21 @@ _CODEX_API_RE = re.compile(r"tools\.([A-Za-z_][A-Za-z_0-9]*)\s*\(")
 
 # Model in force -> canonical pricing label. Substring, not prefix: the corpus
 # carries "gpt5.6-sol" (missing separator) alongside "gpt-5.6-sol". An
-# unrecognised gpt-5.6-* variant bills at the FLAGSHIP rate, the opposite of
-# the Kimi ladder's conservative fallback: here a wrong overcount is visible
-# and arguable, while a wrong undercount silently understates the bill.
-_CODEX_FLAGSHIP = "gpt-5.6-sol"
+# unrecognised model bills at the FLAGSHIP rate, the opposite of the Kimi
+# ladder's conservative fallback: here a wrong overcount is visible and
+# arguable, while a wrong undercount silently understates the bill.
+#
+# EVERY MODEL THE CORPUS NAMES NEEDS A ROW HERE, and the cost of forgetting
+# one is not merely a mispriced record: the fallback RELABELS it, so the
+# model disappears from the dashboard entirely and its usage is reported as
+# the flagship's. That is what happened to Astra, which shipped on
+# 2026-09-04 and read as Sol until this row was added.
+#
+# The flagship is whichever current model is most expensive, so the
+# fallback keeps erring upward — Astra at 2.5x Sol now holds that seat.
+_CODEX_FLAGSHIP = "gpt-6-astra"
 _CODEX_MODEL_MAP = (
+    ("astra", "gpt-6-astra"),
     ("terra", "gpt-5.6-terra"),
     ("luna", "gpt-5.6-luna"),
     ("sol", "gpt-5.6-sol"),
@@ -102,7 +112,7 @@ def _codex_model(raw: str | None) -> str:
     """Model string in force -> canonical pricing label.
 
     Only canonical labels may reach pricing.compute_cost: an unmapped id
-    resolves to the cheapest Codex fallback — off by 25x on fresh input
+    resolves to the cheapest Codex fallback — off by 50x on fresh input
     for the flagship, silently.
     """
     lowered = (raw or "").lower()

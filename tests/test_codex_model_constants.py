@@ -63,7 +63,8 @@ def test_context_caps_match_models_the_parsers_emit():
       const prefix = src.slice(0, src.indexOf('function buildSessionTurns'));
       const models = [
         'kimi-k3', 'kimi-k2-7-code', 'kimi-k2-6',
-        'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'unknown'
+        'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna',
+        'unknown'
       ];
       const out = eval(prefix + '\n;Object.fromEntries(models.map(m => [m, capForModel(m)]))');
       console.log(JSON.stringify(out));
@@ -72,6 +73,9 @@ def test_context_caps_match_models_the_parsers_emit():
         "kimi-k3": 256_000,
         "kimi-k2-7-code": 256_000,
         "kimi-k2-6": 256_000,
+        # Astra's API window is 1.05M; a ChatGPT subscription gets 272k, and
+        # that is what every rollout in this corpus runs on.
+        "gpt-6-astra": 272_000,
         "gpt-5.6-sol": 272_000,
         "gpt-5.6-terra": 272_000,
         "gpt-5.6-luna": 272_000,

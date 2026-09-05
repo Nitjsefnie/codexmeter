@@ -26,6 +26,8 @@ def test_k3_rates_match_source():
 
 
 @pytest.mark.parametrize(("model", "want"), [
+    ("gpt-6-astra", {"fresh": 10.00, "create": 12.50,
+                     "read": 1.00, "output": 50.00}),
     ("gpt-5.6-sol", {"fresh": 4.00, "create": 5.00,
                      "read": 0.40, "output": 20.00}),
     ("gpt-5.6-terra", {"fresh": 2.00, "create": 2.50,
@@ -176,7 +178,7 @@ def test_unknown_model_falls_back_to_default():
 # Every label either parser can emit.
 LIVE_MODELS = (
     "kimi-k3", "kimi-k2-7-code", "kimi-k2-6",
-    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
 )
 
 
@@ -302,3 +304,31 @@ def test_mixed_usage_cost_is_sum_of_buckets():
         + 10_000 * 4.00 / 1_000_000
     )
     assert cost == pytest.approx(expected, rel=1e-9)
+
+
+def test_astra_carries_no_dated_window():
+    """Astra shipped after the GPT-5.6 repricings and has held one price.
+
+    A window inherited from a neighbouring key would bill every Astra
+    record before that boundary at rates Astra never charged, so the
+    absence is asserted rather than left to the table's shape.
+    """
+    assert "gpt-6-astra" not in pricing.DATED_RATES
+    for epoch in pricing.RATE_EPOCHS:
+        before = epoch - timedelta(seconds=1)
+        assert pricing.rate_for("gpt-6-astra", before) is (
+            pricing.MODEL_RATES["gpt-6-astra"])
+
+
+def test_astra_is_the_priciest_current_codex_model():
+    """The Codex fallback bills unknown ids at the flagship rate, and
+    parse_codex names Astra as that flagship. If some other current label
+    ever outprices it, the fallback stops erring upward and starts
+    understating — silently, which is the failure mode it exists to avoid.
+    """
+    astra = pricing.MODEL_RATES["gpt-6-astra"]
+    others = [rates for model, rates in pricing.MODEL_RATES.items()
+              if model.startswith("gpt-") and model != "gpt-6-astra"]
+    for rates in others:
+        for bucket in ("fresh", "create", "read", "output"):
+            assert astra[bucket] > rates[bucket]

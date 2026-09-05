@@ -281,7 +281,7 @@ def test_a_file_declaring_no_model_falls_back_rather_than_dropping_records():
     blob = (FIX / "rollout_fork_prefix.jsonl").read_bytes()
     assert _codex_declared_models(blob) == set()
     out = _parse("rollout_fork_prefix.jsonl")
-    assert all(r["model"] == "gpt-5.6-sol" for r in out["records"])
+    assert all(r["model"] == "gpt-6-astra" for r in out["records"])
 
 
 def test_a_file_declaring_several_models_reports_all_of_them():
@@ -295,8 +295,13 @@ def test_a_file_declaring_several_models_reports_all_of_them():
     ("gpt5.6-sol", "gpt-5.6-sol"),        # real: one turn_context spells it so
     ("GPT-5.6-Terra", "gpt-5.6-terra"),
     ("gpt-5.6-luna-preview", "gpt-5.6-luna"),
-    ("gpt-6-unreleased", "gpt-5.6-sol"),  # unknown -> flagship, not the default
-    (None, "gpt-5.6-sol"),
+    # Astra is GPT-6 and priced separately; before it had a row here it
+    # matched no needle and was relabelled to the flagship, which is why the
+    # dashboard reported zero Astra usage while the corpus was half Astra.
+    ("gpt-6-astra", "gpt-6-astra"),
+    ("GPT-6-Astra", "gpt-6-astra"),
+    ("gpt-7-unreleased", "gpt-6-astra"),  # unknown -> flagship, not the default
+    (None, "gpt-6-astra"),
 ])
 def test_model_ids_canonicalise_to_a_priced_label(raw, expected):
     assert _codex_model(raw) == expected
@@ -510,7 +515,8 @@ def test_a_cache_write_is_billed_at_its_own_rate_not_at_fresh_input_rates():
     # Same prompt, but half its uncached part written to cache at 1.25x
     # instead of billed as fresh input at 1x — so it costs strictly MORE.
     assert rec["cost_usd"] > plain["cost_usd"]
-    rates = pricing.rate_for("gpt-5.6-sol", rec["ts"])
+    # The fixture declares no model, so it bills at the flagship rate.
+    rates = pricing.rate_for(_codex_model(None), rec["ts"])
     expected_delta = written * (rates["create"] - rates["fresh"]) / 1_000_000
     assert rec["cost_usd"] - plain["cost_usd"] == pytest.approx(
         expected_delta, abs=1e-6)
@@ -531,7 +537,9 @@ def test_the_billed_buckets_still_partition_the_prompt_exactly_once():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("label", ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
+@pytest.mark.parametrize("label", [
+    "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+])
 def test_every_label_the_codex_parser_emits_is_priced_exactly(label):
     """An unmatched label resolves to the cheapest Codex fallback, which
     would silently understate Sol or Terra while marking the value estimated.
@@ -548,7 +556,7 @@ def test_every_codex_label_lives_in_the_browser_mirrored_table():
     """
     assert set(pricing.MODEL_RATES) == {
         "kimi-k3", "kimi-k2-7-code", "kimi-k2-6",
-        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+        "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     }
 
 
@@ -956,3 +964,13 @@ def test_an_applied_patch_is_not_also_counted_from_its_program_text():
     assert len(patches) == 2
     for tool_use in patches:
         assert (tool_use["lines_added"], tool_use["lines_deleted"]) == (1, 1)
+
+
+def test_every_model_the_corpus_names_has_a_map_row():
+    """The map's fallback RELABELS an unmapped id, so a missing row hides a
+    model from the dashboard rather than merely mispricing it. Each id here
+    is one a rollout has actually carried.
+    """
+    for raw in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        label = _codex_model(raw)
+        assert label == raw, f"{raw} was relabelled to {label}"

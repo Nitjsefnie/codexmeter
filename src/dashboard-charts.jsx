@@ -35,6 +35,7 @@ const COL = {
 // Codex model palette — gpt-5.6-* labels from backend/parse_codex.py,
 // 'unknown' for rows without a model. Hues are colourblind-validated.
 const MODEL_COLORS = {
+  'gpt-6-astra':   '#E8607A',               // rose — star, the GPT-6 flagship
   'gpt-5.6-sol':   '#F0B84E',               // gold — the flagship, sun
   'gpt-5.6-terra': '#4FC7C0',               // teal — earth
   'gpt-5.6-luna':  '#B98BE8',               // violet — moon

@@ -110,8 +110,11 @@ def test_rollouts_ingest_from_an_xz_bucket(fresh_db, codex_r2):
     with db.viz_conn() as c:
         assert _scalar(c, "SELECT COUNT(*) FROM files") == len(codex_r2)
         assert _scalar(c, "SELECT COUNT(*) FROM records") > 0
+        # Every row carries a Codex label, not a Kimi one. Matched on the
+        # family prefix rather than "gpt-5.6-": the fixtures that declare no
+        # model bill at the flagship, which is now GPT-6 Astra.
         assert _scalar(
-            c, "SELECT COUNT(*) FROM records WHERE model LIKE 'gpt-5.6-%'"
+            c, "SELECT COUNT(*) FROM records WHERE model LIKE 'gpt-%'"
         ) == _scalar(c, "SELECT COUNT(*) FROM records")
 
 

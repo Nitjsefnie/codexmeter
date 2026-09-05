@@ -66,7 +66,13 @@ MODEL_RATES = {
     # before them is in DATED_RATES below. In every window of every tier a
     # cached read is 0.1x uncached input and a cache write 1.25x it, which
     # is how the create/read columns here are derived — confirmed against
-    # OpenAI's own Sol table, which prints 4 / 0.4 / 5 / 20.
+    # OpenAI's own Sol table, which prints 4 / 0.4 / 5 / 20, and its Astra
+    # table, which prints 10 / 1 / 12.50 / 50.
+    #
+    # Astra is GPT-6, a separate family from the GPT-5.6 tiers below and the
+    # current flagship at 2.5x Sol. It carries no DATED_RATES window: it has
+    # shipped at one price since the first rollout that names it.
+    "gpt-6-astra":    {"fresh": 10.00, "create": 12.50, "read": 1.00, "output": 50.00},
     "gpt-5.6-sol":    {"fresh": 4.00, "create": 5.00, "read": 0.40, "output": 20.00},
     "gpt-5.6-terra":  {"fresh": 2.00, "create": 2.50, "read": 0.20, "output": 12.00},
     "gpt-5.6-luna":   {"fresh": 0.20, "create": 0.25, "read": 0.02, "output": 1.20},
